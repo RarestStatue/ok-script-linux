@@ -30,11 +30,12 @@ install()
 import ok  # noqa: E402
 from ok import _LAZY_IMPORTS  # noqa: E402
 
-# Names whose *extras* may be absent from a bare checkout. Skipping one hides a real
-# failure, so each skip has to be justified and each is reported.
-OPTIONAL_EXTRAS = {
-    'run_web': "ok-script's 'web' extra (fastapi / uvicorn / pywebview)",
-}
+# There is deliberately no skip list. An earlier version skipped `run_web` on *any*
+# ModuleNotFoundError, on the theory that ok-script's 'web' extra might be absent -- which
+# meant an unrelated missing module (observed: `cv2`) turned a genuine breakage into
+# `SKIP` and let the gate exit 0. `run_web` resolves without the extra anyway, so the skip
+# bought nothing. If an entry ever does need one, match on `exc.name`, never on the
+# exception type.
 
 
 def main() -> int:
@@ -43,7 +44,6 @@ def main() -> int:
         return 0
 
     failed: list[tuple[str, str, str, str]] = []
-    skipped: list[tuple[str, str]] = []
     resolved = 0
 
     for name, (module, attr) in sorted(_LAZY_IMPORTS.items()):
@@ -51,19 +51,14 @@ def main() -> int:
             getattr(importlib.import_module(module), attr)
             resolved += 1
         except Exception as exc:  # noqa: BLE001 - reporting, not handling
-            if name in OPTIONAL_EXTRAS and isinstance(exc, ModuleNotFoundError):
-                skipped.append((name, f'{OPTIONAL_EXTRAS[name]}: {exc}'))
-                continue
             failed.append((name, module, type(exc).__name__, str(exc)))
 
-    for name, why in skipped:
-        print(f'SKIP  {name:<32} missing optional dependency -- {why}')
     for name, module, kind, message in failed:
         print(f'FAIL  {name:<32} {module}  {kind}: {message}')
 
     total = len(_LAZY_IMPORTS)
     print(f'\n{resolved}/{total} _LAZY_IMPORTS entries resolved, '
-          f'{len(skipped)} skipped, {len(failed)} failed  (ok {ok.__file__})')
+          f'{len(failed)} failed  (ok {ok.__file__})')
     return 1 if failed else 0
 
 

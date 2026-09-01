@@ -11,6 +11,11 @@ permissions:
 jobs:
   publish:
     name: Build and publish
+    # Inherited from upstream. This fork keeps `name = "ok-script"` in pyproject.toml on
+    # purpose, so that `ok-script>=2.0.5` resolves against it -- which means a `vX.Y.Z` tag
+    # here would otherwise try to publish a fork build under the upstream project's PyPI
+    # name. Only the upstream repository may run this.
+    if: github.repository == 'ok-oldking/ok-script'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

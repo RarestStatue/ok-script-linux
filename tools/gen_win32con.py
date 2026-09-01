@@ -110,14 +110,27 @@ def __getattr__(name):
 
 
 def used_names() -> list[str]:
-    """Every `win32con.X` referenced under ok/."""
+    """Every `win32con.X` referenced under ok/ and tests/.
+
+    `tests/` counts: `tests/test_notifications.py` uses `VK_ESCAPE`, `VK_END`, `VK_BACK`,
+    `VK_DELETE`, `VK_CONTROL` and `CF_DIB`. Left out, a test that starts using a new
+    constant fails at run time with the generated module's "regenerate with ..."
+    AttributeError instead of failing `--check`.
+    """
     names = set()
     pat = re.compile(r'(?<![\w.])win32con\.(\w+)')
-    generated = {OUT.resolve(), WINREG_OUT.resolve()}
-    for path in sorted((REPO / 'ok').rglob('*.py')):
-        if path.resolve() in generated:   # their docstrings cite `win32/lib/win32con.py`
-            continue
-        names.update(pat.findall(path.read_text(encoding='utf-8')))
+    excluded = {
+        OUT.resolve(),           # docstring cites `win32/lib/win32con.py` -> matches `.py`
+        WINREG_OUT.resolve(),
+        # The meta-test: it scans for this same pattern and deliberately reads an absent
+        # constant to prove __getattr__ raises. Neither is a real usage.
+        (REPO / 'tests' / 'test_linux_win32_compat.py').resolve(),
+    }
+    for root in ('ok', 'tests'):
+        for path in sorted((REPO / root).rglob('*.py')):
+            if path.resolve() in excluded:
+                continue
+            names.update(pat.findall(path.read_text(encoding='utf-8')))
     return sorted(names)
 
 

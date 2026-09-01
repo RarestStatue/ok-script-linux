@@ -49,7 +49,13 @@ python3 -m pytest tests
 
 All four are cheap and each one has caught a real regression. Run them in that order: the
 scanner tells you whether the *shape* of the problem changed before the others tell you
-that something broke.
+that something broke. `.github/workflows/linux.yml` runs the same set on `ubuntu-latest`,
+so a rebase that skips this locally is still caught.
+
+`gen_win32con.py --check` is the one exception: it downloads the pywin32 311 `win_amd64`
+wheel from PyPI on **every** invocation, `--check` included, so it needs the network and
+fails on an offline or rate-limited machine for reasons unrelated to the tree. CI runs it
+as a separate non-blocking job for that reason.
 
 Then bump `FORK_VERSION` in `setup.py` to the new base.
 
@@ -92,10 +98,14 @@ symbol, rather than silently no-opping. Five details are load-bearing:
   patches a throwaway and silently does nothing.
 * **`win32api.MAKELONG` is implemented, not stubbed.** It is a C macro, not an OS call,
   and it is on the hot input path.
-* **`winreg` calls raise `OSError`, and its constants are real.** Callers guard registry
-  lookups with `except OSError`, which is the accurate answer here — there is genuinely no
-  registry — and they combine the constants, so `winreg.KEY_READ | winreg.KEY_WOW64_64KEY`
-  must not be a `TypeError`. `NotImplementedError` escaped ok-ww's game-install detection.
+* **`winreg` calls raise `FileNotFoundError`, and its constants are real.** Callers guard
+  registry lookups two ways — `except OSError` (ok-ww `config.py`,
+  `ok/alas/emulator_windows.py:34,50`) and `except FileNotFoundError`
+  (`emulator_windows.py`, eleven lookups). Only `FileNotFoundError` satisfies both, and it
+  is what real winreg raises for a missing key. A bare `OSError` escaped all eleven and
+  took down `EmulatorManager().all_emulator_instances`; `NotImplementedError` escaped both
+  and took down ok-ww's game-install detection. Callers also combine the constants, so
+  `winreg.KEY_READ | winreg.KEY_WOW64_64KEY` must not be a `TypeError`.
 
 `ok.rotypes` and `ok.capture.windows` cannot be made importable on Linux and are not meant
 to be — `ok/rotypes/inspectable.py:12` uses the COM vtable prototype form
@@ -105,8 +115,29 @@ import sweep.
 
 ## Test baseline on Linux
 
-`python3 -m pytest tests` with the `qt`, `web`, `adb` and `ocr` extras installed:
-**383 passed, 6 failed, 1 skipped** (Python 3.12, `QT_QPA_PLATFORM=offscreen`).
+`opencv-python` must be installed alongside the extras. ~14 modules (`ok/util/color.py`,
+`DeviceManager`, `FeatureSet`, `ok/core/screenshot.py`, `bitblt_utils` ...) `import cv2` at
+module scope, but upstream deliberately does not declare it — `tests/test_package_metadata.py`
+asserts that no profile mentions opencv, so that a headless consumer can choose
+`opencv-python-headless` instead. Downstream ok-ww declares it. Without it you get 20
+collection errors and `check_linux_imports.py` reports 35/70 failed, all
+`No module named 'cv2'` — which reads exactly like a port regression and is not one.
+
+```sh
+pip install -e '.[web,default,qt,adb,ocr,dev]' pytest-qt opencv-python
+QT_QPA_PLATFORM=offscreen python3 -m pytest tests
+```
+
+Do **not** add `-q`: `pytest.ini`'s `addopts` already carries it, and a second `-q` raises
+quiet to level 2, which suppresses the final `N failed, M passed` line entirely. The run
+still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
+crashed run and is not.
+
+Baseline: **376 passed, 6 failed, 1 skipped, 10 subtests passed** (392 collected, Python
+3.12). Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
+failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
+unparented and outlived its widget, firing `og.executor.current_task` into whatever test
+was running next. It is now parented to the tab and guards on `og.executor is None`.
 
 The six failures are Windows-only by construction, not port regressions:
 
@@ -118,4 +149,4 @@ The six failures are Windows-only by construction, not port regressions:
 | `test_web_server` — `test_native_resize_handle_is_invisible_but_not_click_through`, `test_rounded_window_region_tracks_native_window_size` | pywebview WinForms / win32 window shaping |
 
 None sit on the game path. Re-check this list after a rebase; a *new* failure outside it is
-a regression.
+a regression. CI deselects exactly these six by node id — keep the two lists in step.
