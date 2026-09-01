@@ -33,8 +33,20 @@ def lock_path(mutex_name):
     return os.path.join(tempfile.gettempdir(), f'ok-script-{mutex_name}.lock')
 
 
+#: `acquire()` could not even open the lock file. Distinct from None, which means the lock
+#: exists and somebody else holds it -- the caller must not escalate to hunting and killing
+#: a "previous instance" that was never established to exist. See `acquire()`.
+UNAVAILABLE = object()
+
+
 def acquire(mutex_name):
-    """Take the lock, or return None if another live process holds it.
+    """Take the lock, or report why not.
+
+    Returns the handle on success, `None` if another live process holds the lock, and
+    `UNAVAILABLE` if the lock file could not be opened at all (a read-only
+    `XDG_RUNTIME_DIR`, exhausted descriptors, an SELinux denial). Those two failures need
+    opposite responses -- wait-then-terminate for the first, bail out for the second -- so
+    they must not share a return value.
 
     The returned handle is an open file descriptor; hold it for the lifetime of the
     process and pass it to `release()`. flock is tied to the open file description, so a
@@ -46,7 +58,7 @@ def acquire(mutex_name):
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as error:
         logger.error(f'Could not open the single-instance lock {path}: {error}')
-        return None
+        return UNAVAILABLE
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:

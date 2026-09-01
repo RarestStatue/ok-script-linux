@@ -26,9 +26,18 @@ Two names must be real objects rather than stubs:
 * `ctypes.HRESULT` / `ctypes.WINFUNCTYPE` -- `ok/rotypes/delegate.py:9-11` uses them as
   *types* at module scope, so a `_Missing` raises during import.
 
-`winreg` calls raise `OSError` rather than `NotImplementedError` (see `_CALL_ERRORS`), and
-its module carries the real `HKEY_* / KEY_* / REG_*` integers, because callers combine
-them -- `winreg.KEY_READ | winreg.KEY_WOW64_64KEY` is a `TypeError` against stubs.
+`winreg` calls raise `FileNotFoundError` rather than `NotImplementedError` (see
+`_CALL_ERRORS`), and its module carries the real `HKEY_* / KEY_* / REG_*` integers, because
+callers combine them -- `winreg.KEY_READ | winreg.KEY_WOW64_64KEY` is a `TypeError` against
+stubs.
+
+Assumption, audited 2026-09-01: `install()` sets `ctypes.windll`, `.oledll`, `.WinDLL`,
+`.OleDLL`, `.HRESULT` and `.WINFUNCTYPE` on the *global* `ctypes` module, so any library
+that platform-sniffs with `hasattr(ctypes, 'windll')` would conclude it is on Windows.
+No installed dependency does: `psutil`, `pynput`, `mouse`, `pyappify`, `darkdetect`,
+`pywebview`, `setuptools` and the PySide6 stack all branch on `platform.system()` or
+`sys.platform`. Re-check this when a dependency is added; a false positive here shows up
+as a third-party library taking a Windows code path and failing far from this file.
 
 `ok.rotypes` and `ok.capture.windows` still cannot be imported on Linux and are not meant
 to be: `ok/rotypes/inspectable.py:12` uses the COM vtable prototype form
@@ -57,14 +66,25 @@ _STUB_MODULES = (
 # Modules whose calls should raise something other than NotImplementedError.
 #
 # `winreg` is the one that matters. Callers guard it two ways: `try: import winreg /
-# except ImportError`, which a stubbed module defeats, and `except OSError` around each
-# lookup, which is how real winreg reports a missing key. On Linux there is genuinely no
-# registry, so OSError is not a fudge -- it is the accurate answer, and it puts every
-# caller on the "nothing registered" path they already handle. Compare ok-ww's
-# `config.py:_find_most_recently_run_pc_exe`, which returns None under OSError and would
-# otherwise propagate a NotImplementedError out of game-install detection.
+# except ImportError`, which a stubbed module defeats, and an `except` around each lookup,
+# which is how real winreg reports a missing key. On Linux there is genuinely no registry,
+# so raising the missing-key error is not a fudge -- it is the accurate answer, and it puts
+# every caller on the "nothing registered" path they already handle.
+#
+# It must be `FileNotFoundError`, not a bare `OSError`, because the two guard styles in the
+# tree are not interchangeable in that direction:
+#
+#   except OSError            ok-ww `config.py:_find_most_recently_run_pc_exe`,
+#                             `ok/alas/emulator_windows.py:34,50`
+#   except FileNotFoundError  `ok/alas/emulator_windows.py`, 11 lookups (203, 228, 233,
+#                             241, 374, 387, 406, 431, 437, 478, 486)
+#
+# `FileNotFoundError` is a subclass of `OSError`, so it satisfies both -- and it is what
+# real winreg raises for a missing key, so it is also the more accurate stand-in. A bare
+# `OSError` escapes all eleven `except FileNotFoundError` guards and takes down
+# `EmulatorManager().all_emulator_instances`.
 _CALL_ERRORS = {
-    'winreg': OSError,
+    'winreg': FileNotFoundError,
 }
 
 _installed = False

@@ -210,7 +210,9 @@ def _close_mutex_handle(handle):
 
 def _release_mutex():
     global _mutex_handle, _mutex_owner_file
-    if _mutex_handle:
+    # `is not None`, not truthiness: on POSIX the handle is a file descriptor, and `os.open`
+    # returns 0 whenever fd 0 is closed at launch. A falsy test leaks the lock at exit.
+    if _mutex_handle is not None:
         try:
             _close_mutex_handle(_mutex_handle)
         except (AttributeError, OSError):
@@ -242,7 +244,7 @@ def _retain_mutex(handle, owner_file):
 
 def _check_mutex_posix(wait_time, kill_wait_time):
     """`check_mutex` for POSIX: same policy, `flock` in place of a named kernel mutex."""
-    from ok.compat.single_instance import acquire
+    from ok.compat.single_instance import UNAVAILABLE, acquire
 
     path = os.getcwd()
     mutex_name = hashlib.md5(path.encode()).hexdigest()
@@ -250,6 +252,13 @@ def _check_mutex_posix(wait_time, kill_wait_time):
 
     handle = acquire(mutex_name)
     logger.info(f'single-instance lock {mutex_name}')
+    if handle is UNAVAILABLE:
+        # The lock file could not be opened, so nothing is known about other instances.
+        # Waiting and then terminating "the previous instance" would hunt a process that
+        # was never shown to exist; refuse to start instead.
+        logger.error(
+            f'The single-instance lock {mutex_name} could not be opened; not starting.')
+        return False
     if handle is not None:
         _retain_mutex(handle, owner_file)
         return True
@@ -260,7 +269,7 @@ def _check_mutex_posix(wait_time, kill_wait_time):
 
     def try_acquire():
         acquired = acquire(mutex_name)
-        if acquired is None:
+        if acquired is None or acquired is UNAVAILABLE:
             return False
         _retain_mutex(acquired, owner_file)
         logger.info(f"Lock {mutex_name} released. Proceeding.")
@@ -288,7 +297,7 @@ def _check_mutex_posix(wait_time, kill_wait_time):
 
 
 def check_mutex(wait_time=5, kill_wait_time=3):
-    if _mutex_handle:
+    if _mutex_handle is not None:      # a POSIX fd of 0 is falsy but held -- see _release_mutex
         return True
     if sys.platform != 'win32':
         return _check_mutex_posix(wait_time, kill_wait_time)

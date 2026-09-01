@@ -55,12 +55,18 @@ class TestWin32ConConstants(unittest.TestCase):
 
         used = set()
         pattern = re.compile(r'(?<![\w.])win32con\.(\w+)')
-        generated = {REPO / 'ok' / 'compat' / 'win32con_constants.py',
-                     REPO / 'ok' / 'compat' / 'winreg_constants.py'}
-        for path in (REPO / 'ok').rglob('*.py'):
-            if path in generated:      # their docstrings cite `win32/lib/win32con.py`
-                continue
-            used.update(pattern.findall(path.read_text(encoding='utf-8')))
+        excluded = {REPO / 'ok' / 'compat' / 'win32con_constants.py',
+                    REPO / 'ok' / 'compat' / 'winreg_constants.py',
+                    # this file: it scans for the same pattern, and reads an absent
+                    # constant on purpose below. Neither is a real usage.
+                    pathlib.Path(__file__).resolve()}
+        # tests/ too: test_notifications.py uses six constants of its own, and a new one
+        # there must fail here rather than at run time. Matches tools/gen_win32con.py.
+        for root in ('ok', 'tests'):
+            for path in (REPO / root).rglob('*.py'):
+                if path in excluded:
+                    continue
+                used.update(pattern.findall(path.read_text(encoding='utf-8')))
 
         missing = sorted(n for n in used if not hasattr(win32con, n))
         self.assertEqual([], missing,
@@ -121,17 +127,29 @@ class TestWin32Stub(unittest.TestCase):
         """`ok/alas/emulator_windows.py` imports it at module level, uncaught."""
         import winreg  # noqa: F401
 
-    def test_winreg_calls_raise_oserror(self):
-        """Callers guard registry lookups with `except OSError`, which is accurate here:
-        on Linux there is genuinely no registry. NotImplementedError would escape those
-        guards -- e.g. out of ok-ww's game-install detection.
+    def test_winreg_calls_raise_the_missing_key_error(self):
+        """Callers guard registry lookups two different ways, and both must catch.
+
+        `except OSError` (ok-ww `config.py`, `emulator_windows.py:34,50`) and
+        `except FileNotFoundError` (`emulator_windows.py`, eleven lookups). Only
+        `FileNotFoundError` satisfies both -- a bare `OSError` escapes all eleven -- and it
+        is what real winreg raises for a missing key. `NotImplementedError` escapes both.
         """
         import winreg
 
-        with self.assertRaises(OSError):
-            winreg.OpenKey(0, r'Software\Microsoft')
-        with self.assertRaises(OSError):
-            winreg.QueryValueEx(0, 'InstallPath')
+        for call in (lambda: winreg.OpenKey(0, r'Software\Microsoft'),
+                     lambda: winreg.QueryValueEx(0, 'InstallPath')):
+            with self.assertRaises(OSError):
+                call()
+            with self.assertRaises(FileNotFoundError):
+                call()
+
+    def test_emulator_registry_scan_reports_nothing_rather_than_escaping(self):
+        """The end-to-end shape of the bug a bare OSError caused: every lookup in
+        `all_emulator_instances` is wrapped in `except FileNotFoundError`."""
+        from ok.alas.emulator_windows import EmulatorManager
+
+        self.assertEqual([], EmulatorManager().all_emulator_instances)
 
     def test_winreg_constants_are_real_integers(self):
         """Callers combine them: `KEY_READ | KEY_WOW64_64KEY` is a TypeError on stubs."""
@@ -295,6 +313,36 @@ class TestSingleInstanceLock(unittest.TestCase):
         self.assertTrue(process.check_mutex())
         self.assertIsNotNone(process._mutex_handle)
         self.assertTrue(process.check_mutex(), 'must be re-entrant for the same process')
+
+    def test_a_handle_of_fd_zero_is_still_held_and_still_released(self):
+        """`os.open` returns 0 when fd 0 is closed at launch, and 0 is falsy. Testing the
+        handle for truthiness short-circuits the re-entrancy check and leaks the lock."""
+        import ok.util.process as process
+
+        released = []
+        with unittest.mock.patch.object(process, '_mutex_handle', 0), \
+                unittest.mock.patch.object(process, '_mutex_owner_file', None), \
+                unittest.mock.patch.object(process, '_close_mutex_handle', released.append):
+            self.assertTrue(process.check_mutex(), 'fd 0 is a held lock, not a free one')
+            process._release_mutex()
+        self.assertEqual([0], released, 'fd 0 must be closed, not skipped as falsy')
+
+    def test_an_unopenable_lock_file_is_not_reported_as_a_rival_instance(self):
+        """A lock file that cannot be opened says nothing about other instances. Conflating
+        it with "somebody holds the lock" sends check_mutex on to terminate a previous
+        instance it never established exists."""
+        import ok.compat.single_instance as single_instance
+        import ok.util.process as process
+
+        with unittest.mock.patch.object(
+                single_instance, 'lock_path',
+                return_value='/proc/self/no/such/directory/ok.lock'):
+            self.assertIs(single_instance.UNAVAILABLE, single_instance.acquire(self.name))
+
+            with unittest.mock.patch.object(
+                    process, '_terminate_previous_instances') as terminate:
+                self.assertFalse(process.check_mutex(wait_time=0, kill_wait_time=0))
+            terminate.assert_not_called()
 
 
 @skip_on_windows
