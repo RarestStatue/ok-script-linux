@@ -11,6 +11,13 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+if sys.platform != 'win32':
+    # Must run before any `ok.*` module that touches a Windows-only name at import
+    # scope. Nothing below this line is safe to reorder above it. No-op on Windows.
+    from ok.compat.win32_stub import install as _install_win32_stub
+
+    _install_win32_stub()
+
 from ok.util.handler import Handler, ExitEvent
 from ok.util.logger import Logger
 from ok.util.file import get_path_relative_to_exe
@@ -696,16 +703,23 @@ class OK:
         register_notifications(self.global_config)
         og.global_config = self.global_config
         og.set_use_dml()
-        try:
-            import ctypes
-            # Set DPI Awareness (Windows 10 and 8)
-            errorCode = ctypes.windll.shcore.SetProcessDpiAwareness(2)
-            logger.info(f'SetProcessDpiAwareness {errorCode}')
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                # Set DPI Awareness (Windows 10 and 8)
+                errorCode = ctypes.windll.shcore.SetProcessDpiAwareness(2)
+                logger.info(f'SetProcessDpiAwareness {errorCode}')
+                if self.debug:
+                    import win32api
+                    win32api.SetConsoleCtrlHandler(self.console_handler, True)
+            except Exception as e:
+                logger.error(f'SetProcessDpiAwareness error', e)
+        else:
+            # No DPI-awareness call on Linux; scaling is the compositor's business. The
+            # console handler does have a POSIX equivalent -- register it under exactly the
+            # same `self.debug` condition Windows uses, so behaviour matches.
             if self.debug:
-                import win32api
-                win32api.SetConsoleCtrlHandler(self.console_handler, True)
-        except Exception as e:
-            logger.error(f'SetProcessDpiAwareness error', e)
+                self._install_posix_signal_handlers()
         self.config = config
         try:
             self.do_init()
@@ -1037,6 +1051,27 @@ class OK:
             if (self.exit_event.is_set() and self.task_executor.thread
                     and self.task_executor.thread != threading.current_thread()):
                 self.task_executor.thread.join(timeout=10)
+
+    def _install_posix_signal_handlers(self):
+        """POSIX stand-in for `win32api.SetConsoleCtrlHandler` (Linux/macOS).
+
+        SIGINT maps to CTRL_C_EVENT (dump threads, then quit) and SIGTERM to
+        CTRL_CLOSE_EVENT (quit), which is the closest correspondence Windows offers.
+        Only the main thread may install handlers, so this is a no-op elsewhere.
+        """
+        import signal
+        import threading
+
+        import win32con
+        if threading.current_thread() is not threading.main_thread():
+            return
+        mapping = {signal.SIGINT: win32con.CTRL_C_EVENT,
+                   signal.SIGTERM: win32con.CTRL_CLOSE_EVENT}
+        for sig, event in mapping.items():
+            try:
+                signal.signal(sig, lambda _s, _f, _event=event: self.console_handler(_event))
+            except (ValueError, OSError) as e:
+                logger.error(f'could not install handler for {sig!r}', e)
 
     def console_handler(self, event):
         import win32con

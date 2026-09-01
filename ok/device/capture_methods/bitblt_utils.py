@@ -6,6 +6,7 @@ import win32con
 import win32gui
 import win32ui
 
+from ok.device.capture_methods.geometry import get_crop_point, parse_reg_flag  # noqa: F401  (re-export)
 from ok.util.logger import Logger
 
 logger = Logger.get_logger(__name__)
@@ -166,13 +167,6 @@ class BitBltCtxDummy:
 
 
 
-def get_crop_point(frame_width, frame_height, target_width, target_height):
-    x = round((frame_width - target_width) / 2)
-    y = (frame_height - target_height) - x
-    return x, y
-
-
-
 def composite_hwnds(bg, hwnd_window, contexts, render_full):
     hwnds = getattr(hwnd_window, 'hwnds', None)
 
@@ -257,18 +251,3 @@ def composite_hwnds(bg, hwnd_window, contexts, render_full):
                     channels = min(bg.shape[2], img.shape[2])
                     bg[y1:y2, x1:x2, :channels] = img[src_y1:src_y2, src_x1:src_x2, :channels]
     return bg
-
-
-
-def parse_reg_flag(value, flag_name):
-    if not value or not isinstance(value, str): return None
-    parts = value.split(';')
-    for part in parts:
-        kv = part.split('=')
-        if len(kv) == 2 and kv[0].strip() == flag_name:
-            try:
-                v = int(kv[1])
-                return v % 2 != 0
-            except:
-                pass
-    return None
