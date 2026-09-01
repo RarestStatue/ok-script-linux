@@ -118,6 +118,40 @@ class TestWin32Stub(unittest.TestCase):
         """`ok/alas/emulator_windows.py` imports it at module level, uncaught."""
         import winreg  # noqa: F401
 
+    def test_winreg_calls_raise_oserror(self):
+        """Callers guard registry lookups with `except OSError`, which is accurate here:
+        on Linux there is genuinely no registry. NotImplementedError would escape those
+        guards -- e.g. out of ok-ww's game-install detection.
+        """
+        import winreg
+
+        with self.assertRaises(OSError):
+            winreg.OpenKey(0, r'Software\Microsoft')
+        with self.assertRaises(OSError):
+            winreg.QueryValueEx(0, 'InstallPath')
+
+    def test_makelong_is_implemented_not_stubbed(self):
+        """A C macro on the hot input path, not an OS call."""
+        import win32api
+
+        self.assertEqual((4 << 16) | 3, win32api.MAKELONG(3, 4))
+        self.assertEqual(0, win32api.MAKELONG(0, 0))
+        # packs into the low/high 16 bits, discarding overflow, as the macro does
+        self.assertEqual((1 << 16) | 0xFFFF, win32api.MAKELONG(0xFFFF, 1))
+
+    def test_attribute_access_is_memoised(self):
+        """`ctypes.windll.user32` must be one object, as in real ctypes -- otherwise
+        `patch('pkg.ctypes.windll.user32.GetDpiForWindow')` patches a throwaway.
+        """
+        import ctypes
+
+        self.assertIs(ctypes.windll.user32, ctypes.windll.user32)
+        ctypes.windll.user32.GetDpiForWindow = lambda hwnd: 144
+        try:
+            self.assertEqual(144, ctypes.windll.user32.GetDpiForWindow(0))
+        finally:
+            del ctypes.windll.user32.GetDpiForWindow
+
 
 @skip_on_windows
 class TestDeviceLayerImports(unittest.TestCase):

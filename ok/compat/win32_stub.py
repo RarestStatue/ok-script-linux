@@ -26,6 +26,8 @@ Two names must be real objects rather than stubs:
 * `ctypes.HRESULT` / `ctypes.WINFUNCTYPE` -- `ok/rotypes/delegate.py:9-11` uses them as
   *types* at module scope, so a `_Missing` raises during import.
 
+`winreg` calls raise `OSError` rather than `NotImplementedError`; see `_CALL_ERRORS`.
+
 `ok.rotypes` and `ok.capture.windows` still cannot be imported on Linux and are not meant
 to be: `ok/rotypes/inspectable.py:12` uses the COM vtable prototype form
 `WINFUNCTYPE(...)(0, "QueryInterface")`, which `CFUNCTYPE` rejects, and there is no
@@ -49,6 +51,19 @@ _STUB_MODULES = (
     'win32api', 'win32gui', 'win32process', 'win32ui', 'win32file', 'win32clipboard',
     'pythoncom', 'pydirectinput', 'pycaw', 'comtypes', 'd3dshot', 'winreg',
 )
+
+# Modules whose calls should raise something other than NotImplementedError.
+#
+# `winreg` is the one that matters. Callers guard it two ways: `try: import winreg /
+# except ImportError`, which a stubbed module defeats, and `except OSError` around each
+# lookup, which is how real winreg reports a missing key. On Linux there is genuinely no
+# registry, so OSError is not a fudge -- it is the accurate answer, and it puts every
+# caller on the "nothing registered" path they already handle. Compare ok-ww's
+# `config.py:_find_most_recently_run_pc_exe`, which returns None under OSError and would
+# otherwise propagate a NotImplementedError out of game-install detection.
+_CALL_ERRORS = {
+    'winreg': OSError,
+}
 
 _installed = False
 
@@ -77,8 +92,9 @@ class _Missing:
     # real `win32gui`. With __slots__ that fails as
     # `AttributeError: '_Missing' object has no attribute 'GetClientRect'`.
 
-    def __init__(self, path, attrs=None):
+    def __init__(self, path, attrs=None, error=NotImplementedError):
         self._path = path
+        self._error = error
         if attrs:
             self.__dict__.update(attrs)
 
@@ -87,10 +103,11 @@ class _Missing:
 
     def __getattr__(self, name):
         # Dunder lookups must fail normally, or copy/pickle/inspect/unittest.mock get
-        # handed a _Missing where they expect a real protocol method.
-        if name.startswith('__') and name.endswith('__'):
+        # handed a _Missing where they expect a real protocol method. The two own fields
+        # are listed so a half-initialised instance cannot recurse through __getattr__.
+        if name in ('_path', '_error') or (name.startswith('__') and name.endswith('__')):
             raise AttributeError(name)
-        child = _Missing(f'{self._path}.{name}')
+        child = _Missing(f'{self._path}.{name}', error=self._error)
         # Memoise into __dict__, so `ctypes.windll.user32` is the *same* object every
         # time -- as it is in real ctypes. Without this, `patch('pkg.ctypes.windll.'
         # 'user32.GetDpiForWindow', ...)` patches a throwaway and silently does nothing,
@@ -101,9 +118,9 @@ class _Missing:
     def __call__(self, *args, **kwargs):
         leaf = self._path.rsplit('.', 1)[-1]
         if leaf in _LOADERS:
-            return _Missing(f'{self._path}(...)')
-        raise NotImplementedError(
-            f'Windows-only symbol called on Linux: {self._path}'
+            return _Missing(f'{self._path}(...)', error=self._error)
+        raise self._error(
+            f'Windows-only symbol called on {sys.platform}: {self._path}'
         )
 
 
@@ -128,8 +145,11 @@ def install():
 
     # --- modules -----------------------------------------------------------------------
     for name in _STUB_MODULES:
-        sys.modules.setdefault(
-            name, _Missing(name, _REAL_IMPLEMENTATIONS.get(name)))
+        sys.modules.setdefault(name, _Missing(
+            name,
+            _REAL_IMPLEMENTATIONS.get(name),
+            error=_CALL_ERRORS.get(name, NotImplementedError),
+        ))
 
     # win32con is the one that must carry real values -- see the module docstring.
     from ok.compat import win32con_constants
