@@ -19,10 +19,22 @@ BitBlt, WGC, DXGI, ADB, browser and NemuIPC backends), so Linux is one more back
 | 3 | `X11CaptureMethod` — `XGetImage` + MIT-SHM | not started |
 | 4 | `WinePostMessageInteraction` + the in-prefix `PostMessage` shim | not started |
 
-Phase 1 makes the tree *importable and testable* on Linux. It does not yet make the app
-*useful* on Linux: `ok/util/window.py` still holds the Windows implementations of
+Phase 1 makes the tree *importable, startable and testable* on Linux. It does not yet
+make the app *useful*: `ok/util/window.py` still holds the Windows implementations of
 `find_hwnd` / `get_window_bounds`, which import cleanly here but raise
 `NotImplementedError` naming the symbol if called. Phase 2 replaces those bodies.
+
+Where startup stops today, with ok-ww's config on Linux:
+
+```
+OK(config) -> DeviceManager.__init__ -> HwndWindow.__init__
+           -> hwnd_window.py:392 get_monitors_bounds()
+           -> NotImplementedError: win32api.EnumDisplayMonitors
+```
+
+That is Phase 2's first line of work (XRandR via python-xlib), and everything before it —
+config load, game-install detection, the single-instance lock, the whole lazy-import
+graph, `DeviceManager` construction — now runs.
 
 ## Rebasing onto a new upstream tag
 
@@ -51,6 +63,7 @@ where there was no alternative, to keep rebases cheap:
 | `ok/compat/win32_stub.py` | **new** — makes Windows-only import-time names exist |
 | `ok/compat/win32con_constants.py` | **new**, generated — the 94 `win32con` constants the tree uses, with real values |
 | `ok/compat/winreg_constants.py` | **new**, generated — the `HKEY_* / KEY_* / REG_*` integers |
+| `ok/compat/single_instance.py` | **new** — `flock` single-instance lock, in place of the Windows named mutex |
 | `ok/device/capture_methods/geometry.py` | **new** — `get_crop_point` / `parse_reg_flag`, split out of the win32-flavoured `bitblt_utils` so the Linux capture path can use them |
 | `conftest.py` | **new** — installs the shim before pytest collection |
 | `tools/` | **new** — the three checks above |
@@ -58,6 +71,7 @@ where there was no alternative, to keep rebases cheap:
 | `setup.py` | version no longer derived from a live PyPI query |
 | `ok/__init__.py` | calls `win32_stub.install()` on non-win32; POSIX signal handlers in place of `SetConsoleCtrlHandler` |
 | `ok/device/capture_methods/bitblt_utils.py` | re-exports the two moved functions |
+| `ok/util/process.py` | POSIX branch in `check_mutex`, same wait / identify-owner / terminate policy |
 
 ### The compatibility shim
 
@@ -92,7 +106,7 @@ import sweep.
 ## Test baseline on Linux
 
 `python3 -m pytest tests` with the `qt`, `web`, `adb` and `ocr` extras installed:
-**378 passed, 6 failed, 1 skipped** (Python 3.12, `QT_QPA_PLATFORM=offscreen`).
+**383 passed, 6 failed, 1 skipped** (Python 3.12, `QT_QPA_PLATFORM=offscreen`).
 
 The six failures are Windows-only by construction, not port regressions:
 

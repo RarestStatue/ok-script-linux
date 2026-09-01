@@ -6,10 +6,12 @@ ordering requirement real Linux entry points have.
 
 import ast
 import importlib
+import os
 import pathlib
 import re
 import sys
 import unittest
+import unittest.mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -234,6 +236,65 @@ class TestGeometryExtraction(unittest.TestCase):
         self.assertIsNone(parse_reg_flag('a=x', 'a'))
         self.assertIsNone(parse_reg_flag('', 'a'))
         self.assertIsNone(parse_reg_flag(None, 'a'))
+
+
+@skip_on_windows
+class TestSingleInstanceLock(unittest.TestCase):
+    """POSIX stand-in for the Windows named mutex in `check_mutex`."""
+
+    def setUp(self):
+        import tempfile
+
+        self.runtime = tempfile.mkdtemp(prefix='okww-lock-')
+        patcher = unittest.mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': self.runtime})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.name = 'test' + str(os.getpid())
+
+    def test_acquire_then_release_round_trips(self):
+        from ok.compat.single_instance import acquire, release
+
+        handle = acquire(self.name)
+        self.assertIsNotNone(handle)
+        release(handle)
+
+        again = acquire(self.name)
+        self.assertIsNotNone(again, 'release must let the next acquire through')
+        release(again)
+
+    def test_a_second_holder_is_refused(self):
+        """flock binds to the open file description, so this conflicts even in-process --
+        matching CreateMutexW reporting ERROR_ALREADY_EXISTS."""
+        from ok.compat.single_instance import acquire, release
+
+        held = acquire(self.name)
+        self.addCleanup(release, held)
+        self.assertIsNone(acquire(self.name))
+
+    def test_lock_lives_under_xdg_runtime_dir_when_there_is_one(self):
+        from ok.compat.single_instance import acquire, lock_path, release
+
+        self.assertTrue(lock_path(self.name).startswith(self.runtime))
+        handle = acquire(self.name)
+        self.addCleanup(release, handle)
+        self.assertTrue(os.path.exists(lock_path(self.name)))
+
+    def test_falls_back_to_tempdir_without_xdg_runtime_dir(self):
+        import tempfile
+
+        from ok.compat.single_instance import lock_path
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('XDG_RUNTIME_DIR', None)
+            self.assertTrue(lock_path(self.name).startswith(tempfile.gettempdir()))
+
+    def test_check_mutex_takes_the_posix_path_and_is_re_entrant(self):
+        import ok.util.process as process
+
+        self.addCleanup(process._release_mutex)
+        self.assertTrue(process.check_mutex())
+        self.assertIsNotNone(process._mutex_handle)
+        self.assertTrue(process.check_mutex(), 'must be re-entrant for the same process')
 
 
 @skip_on_windows

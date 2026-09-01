@@ -200,11 +200,19 @@ def _terminate_previous_instances(owner_file):
     return terminated
 
 
+def _close_mutex_handle(handle):
+    if sys.platform == 'win32':
+        ctypes.windll.kernel32.CloseHandle(handle)
+    else:
+        from ok.compat.single_instance import release
+        release(handle)
+
+
 def _release_mutex():
     global _mutex_handle, _mutex_owner_file
     if _mutex_handle:
         try:
-            ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+            _close_mutex_handle(_mutex_handle)
         except (AttributeError, OSError):
             pass
         _mutex_handle = None
@@ -232,9 +240,58 @@ def _retain_mutex(handle, owner_file):
         _mutex_cleanup_registered = True
 
 
+def _check_mutex_posix(wait_time, kill_wait_time):
+    """`check_mutex` for POSIX: same policy, `flock` in place of a named kernel mutex."""
+    from ok.compat.single_instance import acquire
+
+    path = os.getcwd()
+    mutex_name = hashlib.md5(path.encode()).hexdigest()
+    owner_file = os.path.join(tempfile.gettempdir(), f'ok-script-{mutex_name}.pid')
+
+    handle = acquire(mutex_name)
+    logger.info(f'single-instance lock {mutex_name}')
+    if handle is not None:
+        _retain_mutex(handle, owner_file)
+        return True
+
+    logger.error(
+        f'Another instance of this application is already running {mutex_name}. Waiting for it to disappear.')
+    print(f"Another instance of this application is already running. {mutex_name}")
+
+    def try_acquire():
+        acquired = acquire(mutex_name)
+        if acquired is None:
+            return False
+        _retain_mutex(acquired, owner_file)
+        logger.info(f"Lock {mutex_name} released. Proceeding.")
+        return True
+
+    deadline = time.monotonic() + max(0, wait_time)
+    while time.monotonic() < deadline:
+        if try_acquire():
+            return True
+        time.sleep(0.25)
+
+    logger.warning(
+        f"Lock {mutex_name} still held after {wait_time} seconds; checking its recorded owner.")
+    if not _terminate_previous_instances(owner_file):
+        logger.error('No safely identifiable previous instance could be terminated.')
+        return False
+
+    deadline = time.monotonic() + max(0, kill_wait_time)
+    while time.monotonic() < deadline:
+        if try_acquire():
+            return True
+        time.sleep(0.25)
+    logger.error(f"Lock {mutex_name} was not released after terminating its recorded owner.")
+    return False
+
+
 def check_mutex(wait_time=5, kill_wait_time=3):
     if _mutex_handle:
         return True
+    if sys.platform != 'win32':
+        return _check_mutex_posix(wait_time, kill_wait_time)
     _LPSECURITY_ATTRIBUTES = wintypes.LPVOID
     _BOOL = ctypes.c_int
     _DWORD = ctypes.c_ulong
