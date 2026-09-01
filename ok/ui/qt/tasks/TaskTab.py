@@ -41,8 +41,10 @@ class TaskTab(Tab):
         self.task_info_table.setHorizontalHeaderLabels(self.task_info_labels)
         self.update_info_table()
 
-        # Create a QTimer object
-        self.timer = QTimer()
+        # Parented to self, so it is destroyed with the tab instead of outliving it and
+        # firing into whatever is running next -- which is how it leaked across test
+        # boundaries, surfacing as an AttributeError in an unrelated test's Qt event loop.
+        self.timer = QTimer(self)
         self.task_info_container.hide()
 
         # Connect the timer's timeout signal to the update function
@@ -79,6 +81,11 @@ class TaskTab(Tab):
             return ""
 
     def update_info_table(self):
+        if og.executor is None:
+            # No executor yet (early startup) or already torn down. The 1s timer keeps
+            # firing either way, and there is nothing to show.
+            self.task_info_container.hide()
+            return
         current_task = og.executor.current_task
         if current_task is not None and self.in_current_list(current_task):
             current_info_run = (id(current_task), getattr(current_task, 'start_time', None))
