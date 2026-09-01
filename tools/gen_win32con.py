@@ -25,6 +25,30 @@ import zipfile
 PYWIN32_VERSION = '311'
 REPO = pathlib.Path(__file__).resolve().parent.parent
 OUT = REPO / 'ok' / 'compat' / 'win32con_constants.py'
+WINREG_OUT = REPO / 'ok' / 'compat' / 'winreg_constants.py'
+
+# `winreg`'s constants are the same Win32 values, and pywin32's win32con carries them all.
+# Unlike win32con this is emitted whole rather than as a used-names subset: the set is
+# tiny, frozen since Windows NT, and a missing one shows up as a TypeError in bit
+# arithmetic rather than an import error.
+WINREG_PREFIXES = ('HKEY_', 'KEY_', 'REG_')
+
+WINREG_HEADER = '''r"""The `winreg` constants, for Linux.
+
+GENERATED FILE -- do not edit by hand. Regenerate with `python3 tools/gen_win32con.py`,
+which transcribes the values out of pywin32 {version}'s `win32/lib/win32con.py`.
+
+`ok/compat/win32_stub.py` binds these onto the stub `winreg` module. They have to be real
+integers for the same reason `win32con`'s do: callers combine them, e.g.
+`winreg.KEY_READ | winreg.KEY_WOW64_64KEY` in ok-ww's game-install detection, which raises
+`TypeError` against a stub. The functions still raise `OSError` -- there is no registry
+here -- which is the "nothing registered" answer callers already handle.
+
+HKEY_* are normalised to unsigned 32-bit to match CPython's `winreg`, which exposes them
+as e.g. 0x80000001 where pywin32 uses the signed spelling.
+"""
+
+'''
 
 # Grouping is presentation only. Any name used by the tree but absent here is appended to
 # an "Ungrouped" section, so the generator can never silently drop a constant.
@@ -89,15 +113,16 @@ def used_names() -> list[str]:
     """Every `win32con.X` referenced under ok/."""
     names = set()
     pat = re.compile(r'(?<![\w.])win32con\.(\w+)')
+    generated = {OUT.resolve(), WINREG_OUT.resolve()}
     for path in sorted((REPO / 'ok').rglob('*.py')):
-        if path.resolve() == OUT.resolve():
+        if path.resolve() in generated:   # their docstrings cite `win32/lib/win32con.py`
             continue
         names.update(pat.findall(path.read_text(encoding='utf-8')))
     return sorted(names)
 
 
-def pywin32_values(names: list[str]) -> dict[str, int]:
-    """Read the constants out of the pywin32 win_amd64 wheel (never installed, only unzipped)."""
+def pywin32_namespace() -> dict:
+    """Execute pywin32's win32con off the win_amd64 wheel (never installed, only unzipped)."""
     api = f'https://pypi.org/pypi/pywin32/{PYWIN32_VERSION}/json'
     meta = json.load(urllib.request.urlopen(api, timeout=60))
     wheels = [u for u in meta['urls']
@@ -111,7 +136,10 @@ def pywin32_values(names: list[str]) -> dict[str, int]:
     # win32con is pure Python and imports nothing, so executing it on Linux is safe.
     namespace: dict[str, object] = {}
     exec(compile(source, 'win32con.py', 'exec'), namespace)
+    return namespace
 
+
+def pywin32_values(namespace: dict, names: list[str]) -> dict[str, int]:
     missing = [n for n in names if n not in namespace]
     if missing:
         raise SystemExit(f'not in pywin32 {PYWIN32_VERSION}: {missing}')
@@ -119,6 +147,18 @@ def pywin32_values(names: list[str]) -> dict[str, int]:
     if bad:
         raise SystemExit(f'non-integer constants, refusing to emit: {bad}')
     return {n: namespace[n] for n in names}
+
+
+def render_winreg(namespace: dict) -> str:
+    names = sorted(n for n in namespace
+                   if n.startswith(WINREG_PREFIXES) and isinstance(namespace[n], int))
+    lines = []
+    for n in names:
+        v = namespace[n]
+        if n.startswith('HKEY_'):
+            v &= 0xFFFFFFFF
+        lines.append(f'{n} = {v if -0x10 < v < 0x10 else hex(v)}')
+    return WINREG_HEADER.format(version=PYWIN32_VERSION) + '\n'.join(lines) + '\n'
 
 
 def render(values: dict[str, int]) -> str:
@@ -152,19 +192,27 @@ def main() -> int:
                     help='exit non-zero if the checked-in file is stale')
     args = ap.parse_args()
 
+    namespace = pywin32_namespace()
     names = used_names()
-    text = render(pywin32_values(names))
+    outputs = {
+        OUT: render(pywin32_values(namespace, names)),
+        WINREG_OUT: render_winreg(namespace),
+    }
 
     if args.check:
-        current = OUT.read_text(encoding='utf-8') if OUT.exists() else ''
-        if current != text:
-            print(f'{OUT} is stale ({len(names)} constants used); rerun without --check')
+        stale = [path for path, text in outputs.items()
+                 if (path.read_text(encoding='utf-8') if path.exists() else '') != text]
+        for path in stale:
+            print(f'{path} is stale; rerun without --check')
+        if stale:
             return 1
-        print(f'{OUT} is current ({len(names)} constants)')
+        print(f'{OUT} is current ({len(names)} constants); {WINREG_OUT} is current')
         return 0
 
-    OUT.write_text(text, encoding='utf-8')
-    print(f'wrote {OUT} ({len(names)} constants from pywin32 {PYWIN32_VERSION})')
+    for path, text in outputs.items():
+        path.write_text(text, encoding='utf-8')
+        print(f'wrote {path}')
+    print(f'({len(names)} win32con constants from pywin32 {PYWIN32_VERSION})')
     return 0
 
 

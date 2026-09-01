@@ -26,7 +26,9 @@ Two names must be real objects rather than stubs:
 * `ctypes.HRESULT` / `ctypes.WINFUNCTYPE` -- `ok/rotypes/delegate.py:9-11` uses them as
   *types* at module scope, so a `_Missing` raises during import.
 
-`winreg` calls raise `OSError` rather than `NotImplementedError`; see `_CALL_ERRORS`.
+`winreg` calls raise `OSError` rather than `NotImplementedError` (see `_CALL_ERRORS`), and
+its module carries the real `HKEY_* / KEY_* / REG_*` integers, because callers combine
+them -- `winreg.KEY_READ | winreg.KEY_WOW64_64KEY` is a `TypeError` against stubs.
 
 `ok.rotypes` and `ok.capture.windows` still cannot be imported on Linux and are not meant
 to be: `ok/rotypes/inspectable.py:12` uses the COM vtable prototype form
@@ -79,8 +81,16 @@ def _MAKELONG(low, high):
 
 # Windows symbols that are pure arithmetic. Stubbing these would be a false negative: they
 # have exact, portable definitions and the code below calls them on Linux for real.
+def _winreg_constants():
+    from ok.compat import winreg_constants
+    return {n: v for n, v in vars(winreg_constants).items() if not n.startswith('_')}
+
+
+# Windows symbols that must be real rather than stubbed -- either pure arithmetic, or
+# integers the callers combine. Filled in by install(), since some need an import.
 _REAL_IMPLEMENTATIONS = {
-    'win32api': {'MAKELONG': _MAKELONG},
+    'win32api': lambda: {'MAKELONG': _MAKELONG},
+    'winreg': _winreg_constants,
 }
 
 
@@ -145,9 +155,10 @@ def install():
 
     # --- modules -----------------------------------------------------------------------
     for name in _STUB_MODULES:
+        build_attrs = _REAL_IMPLEMENTATIONS.get(name)
         sys.modules.setdefault(name, _Missing(
             name,
-            _REAL_IMPLEMENTATIONS.get(name),
+            build_attrs() if build_attrs else None,
             error=_CALL_ERRORS.get(name, NotImplementedError),
         ))
 

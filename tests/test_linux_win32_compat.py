@@ -53,9 +53,10 @@ class TestWin32ConConstants(unittest.TestCase):
 
         used = set()
         pattern = re.compile(r'(?<![\w.])win32con\.(\w+)')
-        generated = REPO / 'ok' / 'compat' / 'win32con_constants.py'
+        generated = {REPO / 'ok' / 'compat' / 'win32con_constants.py',
+                     REPO / 'ok' / 'compat' / 'winreg_constants.py'}
         for path in (REPO / 'ok').rglob('*.py'):
-            if path == generated:      # its docstring cites `win32/lib/win32con.py`
+            if path in generated:      # their docstrings cite `win32/lib/win32con.py`
                 continue
             used.update(pattern.findall(path.read_text(encoding='utf-8')))
 
@@ -129,6 +130,18 @@ class TestWin32Stub(unittest.TestCase):
             winreg.OpenKey(0, r'Software\Microsoft')
         with self.assertRaises(OSError):
             winreg.QueryValueEx(0, 'InstallPath')
+
+    def test_winreg_constants_are_real_integers(self):
+        """Callers combine them: `KEY_READ | KEY_WOW64_64KEY` is a TypeError on stubs."""
+        import winreg
+
+        self.assertEqual(0x20019, winreg.KEY_READ)
+        self.assertEqual(0x100, winreg.KEY_WOW64_64KEY)
+        self.assertEqual(0x200, winreg.KEY_WOW64_32KEY)
+        # CPython's winreg exposes the HKEY roots unsigned; pywin32 spells them signed.
+        self.assertEqual(0x80000001, winreg.HKEY_CURRENT_USER)
+        self.assertEqual(0x80000002, winreg.HKEY_LOCAL_MACHINE)
+        self.assertEqual(0x20119, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
 
     def test_makelong_is_implemented_not_stubbed(self):
         """A C macro on the hot input path, not an OS call."""

@@ -50,6 +50,7 @@ where there was no alternative, to keep rebases cheap:
 |---|---|
 | `ok/compat/win32_stub.py` | **new** — makes Windows-only import-time names exist |
 | `ok/compat/win32con_constants.py` | **new**, generated — the 94 `win32con` constants the tree uses, with real values |
+| `ok/compat/winreg_constants.py` | **new**, generated — the `HKEY_* / KEY_* / REG_*` integers |
 | `ok/device/capture_methods/geometry.py` | **new** — `get_crop_point` / `parse_reg_flag`, split out of the win32-flavoured `bitblt_utils` so the Linux capture path can use them |
 | `conftest.py` | **new** — installs the shim before pytest collection |
 | `tools/` | **new** — the three checks above |
@@ -62,7 +63,7 @@ where there was no alternative, to keep rebases cheap:
 
 `ok/compat/win32_stub.py` gives Linux the names 27 modules read at import scope. Imports
 succeed; a code path that genuinely needs Windows raises `NotImplementedError` naming the
-symbol, rather than silently no-opping. Four details are load-bearing:
+symbol, rather than silently no-opping. Five details are load-bearing:
 
 * **DLL loaders must not raise.** Four modules call one *while importing*
   (`ok/util/window.py:18`, `ok/rotypes/roapi.py:7`, `ok/rotypes/winstring.py:6`,
@@ -77,6 +78,10 @@ symbol, rather than silently no-opping. Four details are load-bearing:
   patches a throwaway and silently does nothing.
 * **`win32api.MAKELONG` is implemented, not stubbed.** It is a C macro, not an OS call,
   and it is on the hot input path.
+* **`winreg` calls raise `OSError`, and its constants are real.** Callers guard registry
+  lookups with `except OSError`, which is the accurate answer here — there is genuinely no
+  registry — and they combine the constants, so `winreg.KEY_READ | winreg.KEY_WOW64_64KEY`
+  must not be a `TypeError`. `NotImplementedError` escaped ok-ww's game-install detection.
 
 `ok.rotypes` and `ok.capture.windows` cannot be made importable on Linux and are not meant
 to be — `ok/rotypes/inspectable.py:12` uses the COM vtable prototype form
@@ -87,7 +92,7 @@ import sweep.
 ## Test baseline on Linux
 
 `python3 -m pytest tests` with the `qt`, `web`, `adb` and `ocr` extras installed:
-**375 passed, 6 failed, 1 skipped** (Python 3.12, `QT_QPA_PLATFORM=offscreen`).
+**378 passed, 6 failed, 1 skipped** (Python 3.12, `QT_QPA_PLATFORM=offscreen`).
 
 The six failures are Windows-only by construction, not port regressions:
 
