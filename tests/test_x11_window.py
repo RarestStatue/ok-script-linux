@@ -1152,6 +1152,32 @@ class TestLiveX11(unittest.TestCase):
 
         self.assertFalse(x11.activate(bogus, timeout=0.2))
 
+    def test_resizing_a_window_that_does_not_exist_fails_fast(self):
+        """`ConfigureWindow` is replyless too, and `resize` used to return True for any id.
+
+        `resize_window`'s settle loop was not fooled by it -- it polls the real geometry --
+        but it paid the full 5 seconds to find out. Asking for the (reply-bearing)
+        attributes first makes a dead window a synchronous BadWindow instead.
+        """
+        from ok.compat import x11
+        from ok.util import window
+
+        bogus = 0x7fffffff
+        self.assertFalse(x11.exists(bogus))
+
+        self.assertFalse(x11.resize(bogus, 100, 100))
+        self.assertFalse(x11.resize(bogus, 100, 100, 0, 0))
+
+        start = time.time()
+        self.assertFalse(window.resize_window(bogus, 500, 300))
+        self.assertLess(time.time() - start, 2, 'resize_window must not wait out its settle loop')
+
+    def test_resizing_a_live_window_still_succeeds(self):
+        """The guard must not turn a real resize into a refusal."""
+        from ok.compat import x11
+
+        self.assertTrue(x11.resize(self.wid, 400, 260))
+
 
 if __name__ == '__main__':
     unittest.main()

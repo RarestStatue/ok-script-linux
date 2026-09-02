@@ -510,12 +510,27 @@ def activate(wid, timeout=0.5):
 
 
 def resize(wid, width, height, x=None, y=None):
-    """Resize, and optionally move. False on refusal; the WM may clamp or ignore either."""
+    """Resize, and optionally move. False when the window is gone; the WM may still clamp.
+
+    ``ConfigureWindow`` is replyless, so this cannot report a WM *refusal* -- the shape
+    ``activate()`` had, and here the caller is what settles it: ``resize_window`` polls the
+    real geometry for up to 5 seconds and so is never fooled by an optimistic True. What
+    the caller cannot afford is paying that whole 5 seconds to discover the window never
+    existed, which is what happened while this returned True for any id at all
+    (``resize_window(0x7fffffff, 500, 300)`` -> False in 5.04s).
+
+    ``get_attributes`` *is* reply-bearing, so asking for it first turns a dead window into
+    a synchronous ``BadWindow`` that ``_call`` maps to False, in the same round trip and
+    the same lock. A live window whose WM then ignores or clamps the request still returns
+    True: that is the honest answer for a replyless request, and reading the geometry back
+    is the caller's job.
+    """
     if not wid or width <= 0 or height <= 0:
         return False
 
     def run(d):
         win = _window(d, wid)
+        win.get_attributes()
         if x is None or y is None:
             win.configure(width=int(width), height=int(height))
         else:
