@@ -328,14 +328,23 @@ def _channel_indices(image, masks=None):
     ``None`` for a channel whose mask is absent *or* is not 8 bits wide; the caller falls
     back to :func:`_unpack_wide` for the second case.
     """
+    return _indices_from_fields(_channel_fields(image, masks), image.byte_order)
+
+
+def _indices_from_fields(fields, byte_order):
+    """The index half of :func:`_channel_indices`, for a caller that already has the fields.
+
+    ``image_to_bgr`` needs both, and deriving the fields twice per frame is the only cost
+    the width check would otherwise add to the measured path.
+    """
 
     def index(field):
         if field is None or field[1] != 8:
             return None
         byte = field[0] // 8
-        return byte if image.byte_order == LSB_FIRST else 3 - byte
+        return byte if byte_order == LSB_FIRST else 3 - byte
 
-    return tuple(index(f) for f in _channel_fields(image, masks))
+    return tuple(index(f) for f in fields)
 
 
 def _unpack_wide(array, fields, byte_order):
@@ -378,7 +387,7 @@ def image_to_bgr(image, masks=None):
     if None in fields:
         raise ValueError(f'X11 image has no RGB masks: {frame.red_mask:#x} '
                          f'{frame.green_mask:#x} {frame.blue_mask:#x}')
-    blue, green, red = _channel_indices(frame, masks)
+    blue, green, red = _indices_from_fields(fields, frame.byte_order)
     if (blue, green, red) == (0, 1, 2):
         # The measured path: one 0.15 ms pass that drops the alpha byte and copies.
         bgr = cv2.cvtColor(array, cv2.COLOR_BGRA2BGR)
