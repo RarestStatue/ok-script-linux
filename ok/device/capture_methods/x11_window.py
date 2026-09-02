@@ -29,6 +29,7 @@ Three semantics are easy to get wrong and are load-bearing:
   are 0, and ``hwnds`` is empty.
 """
 
+import os
 import shutil
 import subprocess
 import threading
@@ -63,6 +64,19 @@ def get_monitors_bounds():
     return x11.get_monitors()
 
 
+def _pactl_env():
+    """The environment ``pactl`` is run in: its own output pinned to English.
+
+    ``pactl`` is localized, and ``_parse_sink_inputs`` matches English literals. In de_DE
+    ``Sink Input #`` is ``Ziel-Eingabe #`` and ``Mute:`` is ``Stumm:``; in zh_CN -- the
+    largest part of ok-ww's userbase -- the header is ``信宿输入 #``. The parser then
+    returns nothing, from a command that exited 0 with output on stdout, so mute fails
+    silently and the option appears to work. ``LANGUAGE`` has to be cleared as well: it
+    overrides ``LC_ALL`` for gettext, which is what translates these strings.
+    """
+    return {**os.environ, 'LC_ALL': 'C', 'LANGUAGE': ''}
+
+
 def _pactl(*args):
     """Run ``pactl`` and return stdout, or ``None`` when it is absent or fails."""
     global _pactl_missing_logged
@@ -72,7 +86,8 @@ def _pactl(*args):
             logger.warning('pactl not found, per-application mute is unavailable on this system')
         return None
     try:
-        result = subprocess.run(('pactl',) + args, capture_output=True, text=True, timeout=2)
+        result = subprocess.run(('pactl',) + args, capture_output=True, text=True, timeout=2,
+                                env=_pactl_env())
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning(f'pactl {" ".join(args)} failed: {e}')
         return None
@@ -146,9 +161,17 @@ def get_mute_state(hwnd):
 
 
 def set_mute_state(hwnd, mute):
-    """Mute (1) or unmute (0) every audio stream of the window's process. Never raises."""
+    """Mute (1) or unmute (0) every audio stream of the window's process. Never raises.
+
+    Skips streams already in the requested state. ``handle_mute`` runs at least every 2
+    seconds for the life of the session and upstream's pycaw equivalent is in-process,
+    so every avoided ``pactl`` is a process this port does not spawn.
+    """
+    target = bool(mute)
     try:
-        for index, _ in _sink_inputs_for_hwnd(hwnd):
+        for index, muted in _sink_inputs_for_hwnd(hwnd):
+            if muted == target:
+                continue
             _pactl('set-sink-input-mute', str(index), '1' if mute else '0')
     except Exception as e:
         logger.warning(f"No audio stream for this window, skip mute. Exception: {e}")

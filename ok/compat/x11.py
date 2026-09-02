@@ -22,6 +22,7 @@ Window ids are plain ints, which is what makes them usable as ``hwnd`` -- every
 
 import os
 import threading
+import time
 
 from ok.util.logger import Logger
 
@@ -175,32 +176,58 @@ def _walk_for_clients(d, wid, depth, out):
 def list_clients():
     """Toplevel client windows, in the WM's own order. ``[]`` when X11 is unavailable.
 
-    Three sources, in descending order of trustworthiness:
+    Three sources, **unioned** rather than tried in order, de-duplicated, best first:
 
     1. ``_NET_CLIENT_LIST`` -- EWMH. KWin, Mutter and every WM a Proton game realistically
        runs under publish it; verified present on this machine's Xwayland.
     2. A WM_STATE walk of the root's descendants, for a managed but non-EWMH WM.
     3. The root's own viewable children, for a bare X server with no window manager at all
-       (which is also what CI gets under Xvfb). Noisier, but the callers filter by process
-       and by size anyway.
+       (which is also what CI gets under Xvfb).
+
+    Source 3 is unioned in rather than being a fallback, and it keeps override-redirect
+    windows. A window the WM does not manage is in none of the WM's lists:
+    ``_NET_CLIENT_LIST`` holds only managed clients and ``WM_STATE`` is a property the
+    *WM* sets, so an override-redirect toplevel -- how a client takes the screen without
+    asking, a shape fullscreen-exclusive Wine can produce -- is invisible to both.
+    Returning on the first non-empty source made 3 dead code under any EWMH WM, i.e.
+    always. The callers filter by process, by size and by name, so the extra ids are
+    harmless: a WM's own frames are override-redirect but carry no ``_NET_WM_PID`` and no
+    title, and fall out at the first filter.
+
+    Source 2 stays a fallback, because it is the expensive one: recursing the tree costs
+    ~6 ms against ~1.7 ms for sources 1 and 3 together on a 41-child root, and it can only
+    find windows that source 1 already has whenever EWMH is present. It runs when
+    ``_NET_CLIENT_LIST`` is absent or empty -- a managed but non-EWMH WM, where the root's
+    children are the WM's frames and the clients are one level down.
     """
 
     def run(d):
         import Xlib.X
         root = d.screen().root
-        value = _prop(d, root.id, '_NET_CLIENT_LIST')
-        if value:
-            return [int(w) for w in value]
         out = []
-        _walk_for_clients(d, root.id, 0, out)
-        if out:
-            return out
+        seen = set()
+
+        def add(wid):
+            wid = int(wid)
+            if wid not in seen:
+                seen.add(wid)
+                out.append(wid)
+
+        for wid in (_prop(d, root.id, '_NET_CLIENT_LIST') or []):
+            add(wid)
+        if not out:
+            walked = []
+            _walk_for_clients(d, root.id, 0, walked)
+            for wid in walked:
+                add(wid)
         for child in root.query_tree().children:
+            if child.id in seen:
+                continue
             try:
                 attributes = child.get_attributes()
-                if (attributes.map_state == Xlib.X.IsViewable and not attributes.override_redirect
+                if (attributes.map_state == Xlib.X.IsViewable
                         and attributes.win_class == Xlib.X.InputOutput):
-                    out.append(child.id)
+                    add(child.id)
             except Exception:
                 continue
         return out
@@ -232,18 +259,26 @@ def get_pid(wid):
 
 
 def get_name(wid):
-    """Window title: ``_NET_WM_NAME`` (UTF-8) first, then ``WM_NAME``. ``''`` if unnamed."""
+    """Window title: ``_NET_WM_NAME`` (UTF-8) first, then ``WM_NAME``. ``''`` if unnamed.
+
+    The two properties are typed differently and decoding them the same way mangles
+    accented titles: ``_NET_WM_NAME`` is UTF8_STRING, but ``WM_NAME`` is ICCCM ``STRING``,
+    which is Latin-1 (ICCCM 2.7.1). Only a client that sets no ``_NET_WM_NAME`` reaches
+    the fallback.
+    """
+    encoding = 'utf-8'
     value = get_property(wid, '_NET_WM_NAME')
     if not value:
         value = get_property(wid, 'WM_NAME')
+        encoding = 'latin-1'
     if not value:
         return ''
     if isinstance(value, bytes):
-        return value.decode('utf-8', 'replace')
+        return value.decode(encoding, 'replace')
     if isinstance(value, str):
         return value
     try:
-        return bytes(value).decode('utf-8', 'replace')
+        return bytes(value).decode(encoding, 'replace')
     except Exception:
         return ''
 
@@ -424,7 +459,7 @@ def monitor_for(x, y, width, height):
 
 # --- actions ---------------------------------------------------------------------------
 
-def activate(wid):
+def activate(wid, timeout=0.5):
     """Raise and focus. False if the WM refused -- it must never raise [see Phase 2].
 
     KDE and GNOME both apply focus-stealing prevention, so a refusal is expected rather
@@ -433,6 +468,15 @@ def activate(wid):
     Mapping first is the ICCCM way to de-iconify (4.1.4: a client returns a window to the
     normal state with ``MapWindow``), and it stands in for upstream's
     ``ShowWindow(SW_RESTORE)``. It is a no-op on an already-mapped window.
+
+    The return value is **measured, not assumed**. All three requests issued here --
+    ``MapWindow``, the ``_NET_ACTIVE_WINDOW`` client message, and ``ConfigureWindow`` --
+    carry no reply, so a WM that ignores them is indistinguishable from one that obeyed
+    them until focus is read back. Errors on replyless requests reach ``_on_async_error``,
+    never ``_call``, so returning True after ``sync()`` reported success even for a window
+    id that does not exist. Poll ``is_active`` for ``timeout`` seconds instead and return
+    that. Callers that only want the de-iconify half get it either way: the mapping is
+    already done by the time this returns.
     """
     if not wid:
         return False
@@ -453,7 +497,16 @@ def activate(wid):
         d.sync()
         return True
 
-    return _call(run, False, 'activate') or False
+    if not _call(run, False, 'activate'):
+        return False
+    deadline = time.time() + max(timeout, 0)
+    while True:
+        if is_active(wid):
+            return True
+        if time.time() >= deadline:
+            logger.debug(f'activate {wid}: the window manager did not grant focus within {timeout}s')
+            return False
+        time.sleep(0.05)
 
 
 def resize(wid, width, height, x=None, y=None):

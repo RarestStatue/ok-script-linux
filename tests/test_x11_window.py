@@ -17,6 +17,7 @@ Three kinds of test live here:
 """
 
 import ast
+import itertools
 import os
 import pathlib
 import sys
@@ -112,12 +113,20 @@ class FakeX11:
         return self.exists(wid)
 
     def resize(self, wid, width, height, x=None, y=None):
+        """Sizes and positions the *client*, like `x11.resize`.
+
+        The coordinates are applied the way a reparenting WM applies them under the
+        default NorthWest gravity: they place the frame, so the client lands `top`/`left`
+        inside it. Without that, a fake cannot tell centring the window rect from
+        centring the client.
+        """
         window = self._get(wid)
         if not window:
             return False
         self.resized.append((wid, width, height, x, y))
-        window.geometry = (x if x is not None else window.geometry[0],
-                           y if y is not None else window.geometry[1], width, height)
+        frame_left, _, frame_top, _ = window.frame
+        window.geometry = (x + frame_left if x is not None else window.geometry[0],
+                           y + frame_top if y is not None else window.geometry[1], width, height)
         return True
 
 
@@ -232,6 +241,29 @@ class TestFindHwnd(unittest.TestCase):
         self.assertEqual(0x1400001, hwnd)
         self.assertEqual(r'Z:\games\Client-Win64-Shipping.exe', full_path)
 
+    def test_a_miss_says_why_once_rather_than_five_times_a_second(self):
+        """`(None, 0, ...)` is the same answer for "not running" and for "running, but its
+        `_NET_WM_PID` is a pid this process cannot see" -- which is what a pressure-vessel
+        PID namespace would look like [GATE-1b]. The reasons are logged, and rate-limited
+        because this runs on the 0.2s poll thread."""
+        from ok.compat import window_x11
+        fake = FakeX11([FakeWindow(0x1400001, pid=0, name='Wuthering Waves'),
+                        FakeWindow(0x1400002, pid=4242, name='Steam')])
+
+        with unittest.mock.patch.object(window_x11, 'x11', fake), \
+                unittest.mock.patch.object(window_x11, '_exe_candidates',
+                                           return_value=([('steam.exe', 'steam.exe')], [])), \
+                unittest.mock.patch.object(window_x11, '_last_no_match_log', 0), \
+                unittest.mock.patch.object(window_x11.logger, 'info') as info:
+            for _ in range(5):
+                self.assertEqual(0, window_x11.find_hwnd(None, ['Client-Win64-Shipping.exe'], 0, 0)[1])
+
+        self.assertEqual(1, info.call_count, 'the miss report must be rate-limited')
+        message = info.call_args[0][0]
+        self.assertIn('matched none of 2 toplevel windows', message)
+        self.assertIn('no _NET_WM_PID', message)
+        self.assertIn('does not match', message)
+
     def test_player_id_filters_on_the_command_line(self):
         fake = FakeX11([FakeWindow(0x1400001, pid=4242, name='emulator')])
         candidates = {4242: ([('dnplayer.exe', '/games/dnplayer.exe')], ['/games/dnplayer.exe', '3'])}
@@ -261,6 +293,92 @@ class TestGetWindowBounds(unittest.TestCase):
 
         with unittest.mock.patch.object(window_x11, 'x11', FakeX11()):
             self.assertEqual((0, 0, 0, 0, 0, 0, 1), window_x11.get_window_bounds(0x1400001))
+
+
+@skip_on_windows
+class TestResizeWindow(unittest.TestCase):
+    """`resize_window`'s `width`/`height` are the WINDOW rect, decorations included.
+
+    Both callers pass outer dimensions -- `try_resize_to` adds the border and title-bar
+    height to the target resolution, `start_controller`'s re-centre path passes
+    `window_width`/`window_height` -- because the Windows body calls `SetWindowPos`, which
+    sizes the window rect, and settles against `GetWindowRect`. Sizing the client to those
+    numbers made `try_resize_to` overshoot by a title bar and then report failure, and made
+    the re-centre path grow the window by the frame extents on every single call.
+    """
+
+    FRAME = (4, 4, 28, 0)     # (left, right, top, bottom), a KWin-style decoration
+
+    def _window(self, geometry=(100, 200, 1280, 720)):
+        return FakeWindow(0x1400001, geometry=geometry, frame=self.FRAME)
+
+    def test_the_client_is_sized_to_the_request_minus_the_frame(self):
+        from ok.compat import window_x11
+        fake = FakeX11([self._window()], monitors=((0, 0, 1920, 1080),))
+
+        with unittest.mock.patch.object(window_x11, 'x11', fake):
+            self.assertTrue(window_x11.resize_window(0x1400001, 1288, 748))
+            bounds = window_x11.get_window_bounds(0x1400001)
+
+        self.assertEqual((1280, 720), fake.resized[-1][1:3])
+        self.assertEqual((1288, 748), bounds[2:4], 'the window rect must equal the request')
+        self.assertEqual((1280, 720), bounds[4:6])
+
+    def test_repeated_recentring_does_not_grow_the_window(self):
+        """`start_controller` calls this with `window_width`/`window_height` every poll
+        in which the position is invalid. Sizing the client to them added the frame
+        extents each time, monotonically, until the WM clamped it."""
+        from ok.compat import window_x11
+        fake = FakeX11([self._window()], monitors=((0, 0, 1920, 1080),))
+
+        with unittest.mock.patch.object(window_x11, 'x11', fake):
+            for _ in range(5):
+                bounds = window_x11.get_window_bounds(0x1400001)
+                window_x11.resize_window(0x1400001, bounds[2], bounds[3])
+            final = window_x11.get_window_bounds(0x1400001)
+
+        self.assertEqual((1288, 748), final[2:4])
+        self.assertEqual((1280, 720), final[4:6])
+
+    def test_try_resize_to_hits_the_requested_resolution_and_reports_success(self):
+        """The end-to-end shape of the bug: content one title bar too tall, and
+        `resize hwnd failed` logged even though the window manager obeyed."""
+        from ok.compat import window_x11
+        fake = FakeX11([self._window(geometry=(100, 200, 1000, 600))], monitors=((0, 0, 1920, 1080),))
+        found = ('Wuthering Waves', 0x1400001, r'Z:\WW\Client-Win64-Shipping.exe', 0, 0, 1000, 600, [])
+
+        window, patches = make_x11_window(fake, found, monitors=[(0, 0, 1920, 1080)])
+        try:
+            # `Auto Resize Game Window` defaults to on; make_x11_window turns every option off.
+            window.global_config.get_config.return_value.get.return_value = True
+            self.assertTrue(window.try_resize_to([(1280, 720)]))
+            with unittest.mock.patch.object(window_x11, 'x11', fake):
+                bounds = window_x11.get_window_bounds(0x1400001)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+
+        self.assertEqual((1280, 720), bounds[4:6], 'the content must be the requested resolution')
+        self.assertEqual((1288, 748), (window.window_width, window.window_height))
+
+    def test_the_undecorated_path_is_unchanged(self):
+        from ok.compat import window_x11
+        fake = FakeX11([FakeWindow(0x1400001, geometry=(0, 0, 800, 600))], monitors=((0, 0, 1920, 1080),))
+
+        with unittest.mock.patch.object(window_x11, 'x11', fake):
+            self.assertTrue(window_x11.resize_window(0x1400001, 1280, 720))
+
+        self.assertEqual((0x1400001, 1280, 720, 320, 180), fake.resized[-1])
+
+    def test_a_window_that_never_settles_reports_failure(self):
+        from ok.compat import window_x11
+        fake = FakeX11([self._window()], monitors=((0, 0, 1920, 1080),))
+        fake.resize = lambda *args, **kwargs: True      # the WM ignores the request
+
+        with unittest.mock.patch.object(window_x11, 'x11', fake), \
+                unittest.mock.patch.object(window_x11.time, 'sleep', lambda _: None), \
+                unittest.mock.patch.object(window_x11.time, 'time', itertools.count(0, 2).__next__):
+            self.assertFalse(window_x11.resize_window(0x1400001, 1000, 600))
 
 
 def make_x11_window(fake_x11, find_hwnd_result, capture_method=None, executor=None, monitors=None,
@@ -496,6 +614,55 @@ Sink Input #13
                 unittest.mock.patch.object(x11_window, '_pactl', return_value=self.SINK_INPUTS):
             self.assertEqual(0, x11_window.get_mute_state(0x1400001))
 
+    # The same two streams as SINK_INPUTS, from a de_DE pactl. `pactl` translates its own
+    # output, and every literal this parser matches moves: `Sink Input #` -> `Ziel-Eingabe #`,
+    # `Mute:` -> `Stumm:`. zh_CN, the largest part of ok-ww's userbase, says `信宿输入 #`.
+    SINK_INPUTS_DE = '''Ziel-Eingabe #12
+\tTreiber: PipeWire
+\tStumm: nein
+\tEigenschaften:
+\t\tapplication.process.id = "4242"
+'''
+
+    def test_a_localized_pactl_parses_to_nothing_which_is_why_the_env_is_pinned(self):
+        from ok.device.capture_methods import x11_window
+
+        self.assertEqual([], x11_window._parse_sink_inputs(self.SINK_INPUTS_DE))
+
+    def test_pactl_runs_in_a_c_locale(self):
+        """Silent failure otherwise: exit 0, output on stdout, and nothing parsed."""
+        from ok.device.capture_methods import x11_window
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured['argv'] = argv
+            captured['env'] = kwargs.get('env')
+            return unittest.mock.Mock(returncode=0, stdout=self.SINK_INPUTS, stderr='')
+
+        with unittest.mock.patch.object(x11_window.shutil, 'which', return_value='/usr/bin/pactl'), \
+                unittest.mock.patch.object(x11_window.subprocess, 'run', fake_run):
+            self.assertEqual(self.SINK_INPUTS, x11_window._pactl('list', 'sink-inputs'))
+
+        self.assertEqual(('pactl', 'list', 'sink-inputs'), captured['argv'])
+        self.assertEqual('C', captured['env']['LC_ALL'])
+        # LANGUAGE overrides LC_ALL for gettext, so clearing it is not optional.
+        self.assertEqual('', captured['env']['LANGUAGE'])
+        self.assertIn('PATH', captured['env'], 'the rest of the environment must survive')
+
+    def test_a_stream_already_in_the_requested_state_is_not_rewritten(self):
+        from ok.device.capture_methods import x11_window
+        calls = []
+
+        def fake_pactl(*args):
+            calls.append(args)
+            return self.SINK_INPUTS if args[:2] == ('list', 'sink-inputs') else ''
+
+        with unittest.mock.patch.object(x11_window, 'x11', FakeX11([FakeWindow(0x1400001, pid=999)])), \
+                unittest.mock.patch.object(x11_window, '_pactl', fake_pactl):
+            x11_window.set_mute_state(0x1400001, 1)      # sink input 13 is already muted
+
+        self.assertEqual([('list', 'sink-inputs')], calls)
+
     def test_missing_pactl_is_not_an_error(self):
         from ok.device.capture_methods import x11_window
 
@@ -503,6 +670,28 @@ Sink Input #13
                 unittest.mock.patch.object(x11_window.shutil, 'which', return_value=None):
             self.assertEqual(0, x11_window.get_mute_state(0x1400001))
             x11_window.set_mute_state(0x1400001, 1)
+
+
+@skip_on_windows
+class TestWindowTitles(unittest.TestCase):
+    """`WM_NAME` is ICCCM `STRING`, i.e. Latin-1; only `_NET_WM_NAME` is UTF-8."""
+
+    ACCENTED = 'Wuthering Wavés'
+
+    def _get_name(self, properties):
+        from ok.compat import x11
+
+        with unittest.mock.patch.object(x11, 'get_property', lambda wid, name: properties.get(name)):
+            return x11.get_name(0x1400001)
+
+    def test_net_wm_name_is_decoded_as_utf8(self):
+        self.assertEqual(self.ACCENTED, self._get_name({'_NET_WM_NAME': self.ACCENTED.encode('utf-8')}))
+
+    def test_wm_name_is_decoded_as_latin1(self):
+        self.assertEqual(self.ACCENTED, self._get_name({'WM_NAME': self.ACCENTED.encode('latin-1')}))
+
+    def test_an_unnamed_window_is_the_empty_string(self):
+        self.assertEqual('', self._get_name({}))
 
 
 @skip_on_windows
@@ -556,14 +745,66 @@ class TestUpstreamDrift(unittest.TestCase):
                 return node
         raise AssertionError(f'{class_name} not found in {path}')
 
+    @staticmethod
+    def _self_attributes(target):
+        """`self.a`, `self.a, self.b = ...` and `self.a: int = ...` all set an attribute.
+
+        Only the first shape was collected before, so a `self.x, self.y = x, y` added to
+        upstream's `__init__` -- already idiomatic in that class, `do_update_window_size`
+        uses it -- would have been invisible to the gate.
+        """
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names = set()
+            for element in target.elts:
+                names |= TestUpstreamDrift._self_attributes(element)
+            return names
+        if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                and target.value.id == 'self'):
+            return {target.attr}
+        return set()
+
     @classmethod
     def _init_attributes(cls, node):
         init = next(n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
-        return {target.attr
-                for statement in ast.walk(init)
-                for target in getattr(statement, 'targets', [])
-                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
-                and target.value.id == 'self'}
+        names = set()
+        for statement in ast.walk(init):
+            targets = list(getattr(statement, 'targets', []))
+            if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+                targets.append(statement.target)
+            for target in targets:
+                names |= cls._self_attributes(target)
+        return names
+
+    @staticmethod
+    def _win32_bound_methods(path, class_name):
+        """Upstream methods that reach Win32, directly or through their own module.
+
+        Three sources of taint, all read out of upstream's own file so the list cannot go
+        stale: the `win32*`/`ctypes` modules it imports, the module-level helpers in that
+        file whose bodies use them (`get_monitors_bounds`, `get_mute_state`,
+        `set_mute_state`), and the `ok.util.window` contracts it imports, whose Windows
+        bodies are Win32 and which `ok/compat/window_x11.py` exists to shadow.
+        """
+        tree = ast.parse((REPO / path).read_text(encoding='utf-8'))
+        tainted = {'ctypes'}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                tainted |= {alias.name.split('.')[0] for alias in node.names
+                            if alias.name.startswith('win32') or alias.name == 'ctypes'}
+            elif isinstance(node, ast.ImportFrom) and (node.module or '') == 'ok.util.window':
+                tainted |= {alias.asname or alias.name for alias in node.names}
+
+        def references(node):
+            return ({n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+                    | {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)})
+
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and references(node) & tainted:
+                tainted.add(node.name)
+
+        cls_node = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == class_name)
+        return {n.name for n in cls_node.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and references(n) & tainted}
 
     def test_the_constructor_sets_every_attribute_upstream_sets(self):
         upstream = self._class_node('ok/device/capture_methods/hwnd_window.py', 'HwndWindow')
@@ -574,14 +815,54 @@ class TestUpstreamDrift(unittest.TestCase):
         self.assertEqual(set(), missing,
                          'HwndWindow.__init__ gained attributes; mirror them in X11Window.__init__')
 
-    def test_every_upstream_method_is_inherited_or_overridden(self):
+    def test_every_win32_bound_upstream_method_is_actually_overridden(self):
+        """`hasattr` proves nothing here: X11Window *inherits* everything.
+
+        The gate this replaces asked `hasattr(X11Window, name)` for every name in
+        `vars(HwndWindow)`, which is True by definition for a subclass -- it could not
+        fail, and the drift it advertised (upstream gains a Win32-calling method) would
+        have landed as a silently inherited NotImplementedError at runtime with a green
+        suite. Ask the question that can fail instead: every upstream method that touches
+        Win32 must appear in `vars(X11Window)`, i.e. be genuinely overridden.
+        """
         from ok.device.capture_methods.hwnd_window import HwndWindow
         from ok.device.capture_methods.x11_window import X11Window
 
         self.assertTrue(issubclass(X11Window, HwndWindow))
-        missing = [name for name in vars(HwndWindow) if not name.startswith('__')
-                   and not hasattr(X11Window, name)]
-        self.assertEqual([], missing)
+        win32_bound = self._win32_bound_methods('ok/device/capture_methods/hwnd_window.py', 'HwndWindow')
+        self.assertIn('bring_to_front', win32_bound, 'the taint analysis stopped finding anything')
+
+        inherited = sorted(name for name in win32_bound if name not in vars(X11Window))
+
+        self.assertEqual([], inherited,
+                         'these upstream methods call Win32 and X11Window inherits them unchanged')
+
+    def test_the_method_gate_sees_upstream_growing_a_win32_method(self):
+        """The drift the gate above claims to catch, simulated."""
+        import tempfile
+        source = (REPO / 'ok/device/capture_methods/hwnd_window.py').read_text(encoding='utf-8')
+        marker = 'class HwndWindow:\n'
+        self.assertIn(marker, source)
+        source = source.replace(
+            marker,
+            marker + '\n    def brand_new_win32_method(self):\n        return win32gui.IsWindow(self.hwnd)\n',
+            1)
+        with tempfile.TemporaryDirectory() as tmp:
+            drifted = pathlib.Path(tmp) / 'hwnd_window.py'
+            drifted.write_text(source, encoding='utf-8')
+            with unittest.mock.patch.object(sys.modules[__name__], 'REPO', pathlib.Path(tmp)):
+                win32_bound = self._win32_bound_methods('hwnd_window.py', 'HwndWindow')
+
+        self.assertIn('brand_new_win32_method', win32_bound)
+
+    def test_the_constructor_gate_sees_tuple_and_annotated_targets(self):
+        node = ast.parse('class C:\n'
+                         '    def __init__(self):\n'
+                         '        self.a = 1\n'
+                         '        self.b, self.c = 2, 3\n'
+                         '        self.d: int = 4\n').body[0]
+
+        self.assertEqual({'a', 'b', 'c', 'd'}, self._init_attributes(node))
 
     def test_the_linux_modules_call_no_win32(self):
         for path in ('ok/compat/x11.py', 'ok/compat/window_x11.py',
@@ -713,6 +994,36 @@ class TestLiveX11(unittest.TestCase):
         self.assertFalse(x11.exists(self.wid))
         self.assertEqual((0, 0, 0, 0, 0, 0, 1), window.get_window_bounds(self.wid))
 
+    def test_an_override_redirect_toplevel_is_still_enumerated(self):
+        """The WM's lists hold only what the WM manages.
+
+        `_NET_CLIENT_LIST` contains managed clients and `WM_STATE` is a property the WM
+        sets, so an override-redirect toplevel -- how a client takes the screen without
+        asking, a shape fullscreen-exclusive Wine can produce -- is in neither. Trying the
+        three sources in order and returning on the first non-empty one made every
+        fallback dead code under any EWMH window manager; they are unioned now.
+        """
+        from Xlib import X, Xatom
+        from ok.compat import x11
+
+        screen = self.display.screen()
+        unmanaged = screen.root.create_window(
+            10, 10, 200, 150, 0, screen.root_depth, X.InputOutput, X.CopyFromParent,
+            background_pixel=screen.black_pixel, override_redirect=1)
+        unmanaged.change_property(self.display.get_atom('_NET_WM_PID'), Xatom.CARDINAL, 32, [os.getpid()])
+        unmanaged.map()
+        self.display.sync()
+        try:
+            self.assertTrue(self._wait_for(lambda: unmanaged.id in x11.list_clients()),
+                            'an override-redirect toplevel is invisible to every WM list')
+            if _wm_present():
+                managed = x11.get_property(_root_id(), '_NET_CLIENT_LIST') or []
+                self.assertNotIn(unmanaged.id, [int(w) for w in managed],
+                                 'the WM would have to be managing it for this test to prove anything')
+        finally:
+            unmanaged.destroy()
+            self.display.sync()
+
     def test_monitors_are_reported_as_left_top_right_bottom(self):
         from ok.compat import x11
 
@@ -768,12 +1079,24 @@ class TestLiveX11(unittest.TestCase):
         if not self._wait_for(lambda: x11.is_minimized(self.wid)):
             self.skipTest('the window manager did not iconify the test window')
 
-        self.assertTrue(x11.activate(self.wid))
+        # The return value is now the *focus* answer, which a focus-stealing-prevention
+        # WM is entitled to refuse; the de-iconify half happens either way, and that is
+        # what stands in for ShowWindow(SW_RESTORE).
+        activated = x11.activate(self.wid)
         self._wait_for(lambda: not x11.is_minimized(self.wid))
 
         self.assertFalse(x11.is_minimized(self.wid))
+        if activated:
+            self.assertTrue(x11.is_active(self.wid))
 
     def test_resize_window_reaches_the_requested_size(self):
+        """`width`/`height` are the WINDOW rect, decorations included -- as SetWindowPos.
+
+        Against an undecorated window this is indistinguishable from sizing the client,
+        which is why the decorated assertion below exists as well: sizing the client to
+        these numbers is the bug this test could not see.
+        """
+        from ok.compat import x11
         from ok.util import window
 
         if not _wm_present():
@@ -781,8 +1104,53 @@ class TestLiveX11(unittest.TestCase):
 
         self.assertTrue(window.resize_window(self.wid, 480, 300))
 
-        _, _, _, _, width, height = window.get_window_bounds(self.wid)[:6]
-        self.assertEqual((480, 300), (width, height))
+        left, right, top, bottom = x11.get_frame_extents(self.wid)
+        _, _, window_width, window_height, width, height = window.get_window_bounds(self.wid)[:6]
+        self.assertEqual((480, 300), (window_width, window_height))
+        self.assertEqual((480 - left - right, 300 - top - bottom), (width, height))
+
+    def test_resize_window_centres_the_window_rect_not_the_client(self):
+        """The frame lands on the monitor centre, computed from the outer dimensions.
+
+        A reparenting WM applies ICCCM win_gravity to a ConfigureRequest, so the
+        coordinates handed to `x11.resize` position the *frame*: the client then sits
+        `top`/`left` inside it, and the window rect is what ends up centred. Skipped
+        unless the WM actually decorates, since undecorated makes the two identical.
+        """
+        from ok.compat import x11
+        from ok.util import window
+
+        if not _wm_present():
+            self.skipTest('resize is negotiated with a window manager; none is running')
+        self.assertTrue(window.resize_window(self.wid, 480, 300))
+        left, right, top, bottom = x11.get_frame_extents(self.wid)
+        if not any((left, right, top, bottom)):
+            self.skipTest('this window manager draws no decorations; centring is trivially identical')
+
+        x, y = window.get_window_bounds(self.wid)[:2]
+        monitor = x11.monitor_for(x, y, 480, 300)
+        self.assertIsNotNone(monitor)
+        expected_x = monitor[0] + (monitor[2] - monitor[0] - 480) // 2
+        expected_y = monitor[1] + (monitor[3] - monitor[1] - 300) // 2
+
+        # The client origin is the frame origin plus the extents.
+        self.assertAlmostEqual(expected_x + left, x, delta=2)
+        self.assertAlmostEqual(expected_y + top, y, delta=2)
+
+    def test_activate_reports_a_refusal_rather_than_assuming_success(self):
+        """Every request `activate` issues is replyless, so the answer has to be read back.
+
+        `MapWindow`, the `_NET_ACTIVE_WINDOW` client message and `ConfigureWindow` all
+        return nothing, and their errors are delivered asynchronously to `_on_async_error`
+        rather than to `_call` -- so the old body's `return True` after `sync()` reported
+        success for a window id that has never existed.
+        """
+        from ok.compat import x11
+
+        bogus = 0x7fffffff
+        self.assertFalse(x11.exists(bogus))
+
+        self.assertFalse(x11.activate(bogus, timeout=0.2))
 
 
 if __name__ == '__main__':

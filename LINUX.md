@@ -121,7 +121,7 @@ import sweep.
 | `ok/compat/x11.py` | **new** — the python-xlib window layer: enumeration, `_NET_WM_PID`, geometry, focus, minimized state, RandR monitors, activate, resize. Nothing in it raises; every entry point has a documented empty return |
 | `ok/compat/window_x11.py` | **new** — the Linux bodies of the `ok.util.window` contracts (`find_hwnd`, `get_window_bounds`, `is_foreground_window`, `resize_window`, `find_all_visible_windows`, `show_title_bar`, `get_exe_by_hwnd`, `is_window_minimized`) |
 | `ok/device/capture_methods/x11_window.py` | **new** — `X11Window`, plus `get_monitors_bounds` and the pactl-backed `get_mute_state` / `set_mute_state` |
-| `tests/test_x11_window.py` | **new** — 43 tests: tuple-shape contracts, the two semantics the plan got wrong first time, a drift gate over the copied constructor, and live tests against a real X server |
+| `tests/test_x11_window.py` | **new** — 60 tests: tuple-shape contracts, the two semantics the plan got wrong first time, two drift gates (the copied constructor, and the win32-bound methods that must stay overridden), the `resize_window` window-rect contract, and live tests against a real X server |
 | `ok/device/capture_methods/__init__.py` | rebinds `HwndWindow` to `X11Window` on Linux, and shadows the five helpers line 21 imports from `hwnd_window` |
 | `ok/util/window.py` | imports the X11 bodies over the Win32 ones on non-Windows, at the bottom of the file |
 | `ok/core/screenshot.py` | the annotation font is looked up per platform; `os.environ['WINDIR']` is a `KeyError` here |
@@ -132,7 +132,12 @@ eleven pure ones (`get_abs_cords`, `get_capture_origin`, `get_top_window_cords`,
 `_front_hwnd_candidates`, `_top_hwnd_info`, `__str__`) stay upstream's across rebases.
 `__init__` is a copy, because upstream's calls `get_monitors_bounds()` out of its own
 module globals; `TestUpstreamDrift` walks both ASTs and fails if upstream's constructor
-grows an attribute the copy does not set, or a method the subclass does not have.
+grows an attribute the copy does not set, or if a method that reaches Win32 — directly,
+through the module's own helpers, or through the `ok.util.window` contracts — is left
+inherited rather than overridden. The method half used to ask `hasattr(X11Window, name)`,
+which is True by definition for a subclass: it could not fail, so an upstream rebase that
+added a Win32-calling method would have landed as a silently inherited
+`NotImplementedError` with a green suite.
 
 Three semantics are load-bearing and easy to get backwards:
 
@@ -148,6 +153,28 @@ Three semantics are load-bearing and easy to get backwards:
   X11, so `class_name` / `top_hwnd_class` are accepted and ignored. The game's name lives
   only in the Wine command line, which is why `find_hwnd` matches against every `.exe` on
   it rather than against `/proc/<pid>/exe`.
+
+Three more, found by review after Phase 2 landed and fixed in the same tree:
+
+* **`resize_window`'s `width`/`height` are the *window* rect, decorations included.** That
+  is what the Windows body means — `SetWindowPos` sizes the window rect and the settle
+  check reads `GetWindowRect` — and what both callers pass. X11 has no window rect (the
+  client window *is* the client area), so the function takes `_NET_FRAME_EXTENTS` off
+  before configuring and adds them back for the settle check. Sizing the client to those
+  numbers instead made `try_resize_to` overshoot by a title bar and then report failure
+  despite the WM obeying, and made `start_controller`'s re-centre path grow the window by
+  the frame extents on *every* call, unboundedly.
+* **`pactl` is localized; its output is parsed, so its environment is pinned to `LC_ALL=C`
+  (and `LANGUAGE=''`, which overrides `LC_ALL` for gettext).** In de_DE the header is
+  `Ziel-Eingabe #` and the flag is `Stumm:`; in zh_CN, `信宿输入 #`. Unpinned, `pactl`
+  exits 0 with output on stdout and the parser returns nothing — mute fails silently, and
+  the option looks like it works.
+* **`x11.activate()` measures the answer instead of assuming it.** Every request it issues
+  is replyless and their errors arrive asynchronously, so the old `return True` after
+  `sync()` reported success even for a window id that had never existed. It polls
+  `is_active` for half a second and returns that. The de-iconify half (the `MapWindow`
+  that stands in for `ShowWindow(SW_RESTORE)`) happens either way, so a focus-stealing
+  refusal still restores the window.
 
 `find_hwnd` returns `[]` for its `hwnds` element where Windows returns `[biggest]`: Wine
 gives one X toplevel per game, so there is no child/top window to report. All four
@@ -174,7 +201,7 @@ quiet to level 2, which suppresses the final `N failed, M passed` line entirely.
 still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
 crashed run and is not.
 
-Baseline: **419 passed, 6 failed, 1 skipped, 10 subtests passed** (435 collected, Python
+Baseline: **436 passed, 6 failed, 1 skipped, 10 subtests passed** (452 collected, Python
 3.12) — 376 of those passes predate Phase 2, which added `tests/test_x11_window.py`.
 Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
 failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
@@ -193,7 +220,8 @@ The six failures are Windows-only by construction, not port regressions:
 None sit on the game path. Re-check this list after a rebase; a *new* failure outside it is
 a regression. CI deselects exactly these six by node id — keep the two lists in step.
 
-Eight of the 419 are live X11 tests: they create a real window and drive it through a real
-server. With no `DISPLAY` they skip (`35 passed, 7 skipped` for that file alone), so CI runs
-the suite under `xvfb-run`. Xvfb has no window manager, and the three tests that need one —
-iconify, activation, resize — skip themselves there; they run in full on a desktop session.
+Eleven of the 436 are live X11 tests: they create a real window and drive it through a real
+server. With no `DISPLAY` they skip (`49 passed, 11 skipped` for that file alone), so CI runs
+the suite under `xvfb-run`. Xvfb has no window manager, and the four tests that need one —
+iconify, de-iconify-on-activate, and the two `resize_window` ones — skip themselves there;
+they run in full on a desktop session.

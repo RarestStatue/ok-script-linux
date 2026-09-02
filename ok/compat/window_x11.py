@@ -38,6 +38,12 @@ from ok.util.logger import Logger
 
 logger = Logger.get_logger("capture")
 
+# `find_hwnd` runs on the 0.2s poll thread. When the game is not running it matches
+# nothing on every single call, so its "why did nothing match" report is rate-limited to
+# this interval, and reset as soon as something matches.
+_NO_MATCH_LOG_INTERVAL = 30
+_last_no_match_log = 0
+
 # Wine and Steam helper executables that appear in a game's command line but are never the
 # game. Only used to pick the *primary* exe of a process; matching against a caller's
 # `exe_names` still considers every candidate, so a caller that really wants one of these
@@ -190,36 +196,61 @@ def show_title_bar(hwnd):
 
 
 def resize_window(hwnd, width, height):
-    """Resize to ``width x height`` and centre it on its current monitor.
+    """Resize the **window** rect to ``width x height`` and centre it on its monitor.
 
-    Same contract as the Windows version, including the up-to-5-second settle wait: a WM
-    resize is a request, and the answer arrives asynchronously. False when the window
-    refuses to reach the requested size -- under Proton the game usually owns its own
-    resolution, and upstream's caller treats failure as non-fatal.
+    ``width``/``height`` are outer dimensions -- decorations included -- because that is
+    what the Windows body means: it calls ``SetWindowPos``, which sizes the window rect,
+    and settles against ``GetWindowRect``. Both callers pass outer dimensions:
+    ``try_resize_to`` adds the border and title-bar height it measured to the target
+    resolution, and ``start_controller``'s re-centre path passes ``window_width`` /
+    ``window_height`` straight through. X11 has no window rect -- the client window is the
+    client area and the frame belongs to the WM -- so the frame extents come off here, and
+    go back on for the settle check.
+
+    Sizing the *client* to these numbers instead (which is what this did before) is wrong
+    twice over: ``try_resize_to``'s content ends up one title bar too tall and its success
+    test then fails despite the WM having obeyed, and the re-centre path grows the window
+    by the frame extents on every call, without bound.
+
+    Same contract as the Windows version otherwise, including the up-to-5-second settle
+    wait: a WM resize is a request, and the answer arrives asynchronously. False when the
+    window refuses to reach the requested size -- under Proton the game usually owns its
+    own resolution, and upstream's caller treats failure as non-fatal.
     """
     if not hwnd:
         logger.info("Invalid window handle provided.")
         return False
     try:
-        geometry = x11.get_abs_geometry(hwnd) or (0, 0, width, height)
+        left, right, top, bottom = x11.get_frame_extents(hwnd)
+        # Undecorated (every extent 0) is the byte-identical no-op of the old behaviour.
+        client_width = max(1, width - left - right)
+        client_height = max(1, height - top - bottom)
+        geometry = x11.get_abs_geometry(hwnd) or (0, 0, client_width, client_height)
         bounds = x11.monitor_for(*geometry)
         if bounds:
             monitor_left, monitor_top, monitor_right, monitor_bottom = bounds
+            # Centre the *window* rect, and pass its top-left. A reparenting WM applies
+            # ICCCM win_gravity to a ConfigureRequest, so with the default NorthWest
+            # gravity these coordinates place the frame, not the client -- which is
+            # exactly what centring outer dimensions wants. Verified against KWin.
             center_x = monitor_left + (monitor_right - monitor_left - width) // 2
             center_y = monitor_top + (monitor_bottom - monitor_top - height) // 2
         else:
             center_x, center_y = 0, 0
-        if not x11.resize(hwnd, width, height, center_x, center_y):
+        if not x11.resize(hwnd, client_width, client_height, center_x, center_y):
             return False
 
         start_time = time.time()
         while time.time() - start_time < 5:
             geometry = x11.get_abs_geometry(hwnd)
-            if geometry and geometry[2] == width and geometry[3] == height:
+            extents = x11.get_frame_extents(hwnd)
+            if geometry and (geometry[2] + extents[0] + extents[1] == width
+                             and geometry[3] + extents[2] + extents[3] == height):
                 break
             time.sleep(0.1)
         else:
-            logger.error(f'resize_window {hwnd} did not settle at {width}x{height}')
+            logger.error(f'resize_window {hwnd} did not settle at {width}x{height} '
+                         f'(client target {client_width}x{client_height}, frame {left},{right},{top},{bottom})')
             return False
 
         time.sleep(0.5)
@@ -272,10 +303,20 @@ def find_hwnd(title, exe_names, frame_width, frame_height, player_id=-1, class_n
     from ok.util.window import get_player_id_from_cmdline
 
     results = []
+    # Why a window was rejected is the whole diagnostic value of this function when it
+    # matches nothing -- "game not running" and "the game is running but its _NET_WM_PID
+    # is not a pid we can see" are the same empty tuple otherwise, and the second is
+    # exactly what a pressure-vessel PID namespace would look like [GATE-1b]. Collected
+    # rather than logged inline, and reported at most once every `_NO_MATCH_LOG_INTERVAL`
+    # seconds: this runs on the 0.2s poll thread for the whole time the game is not
+    # running, and five identical lines a second is not diagnosis, it is noise.
+    rejects = []
+    toplevels = 0
     for hwnd in x11.list_clients():
         state = x11.get_wm_state(hwnd)
         if state == x11.WITHDRAWN_STATE:
             continue
+        toplevels += 1
 
         text = x11.get_name(hwnd)
         if title:
@@ -287,12 +328,17 @@ def find_hwnd(title, exe_names, frame_width, frame_height, player_id=-1, class_n
 
         pid = x11.get_pid(hwnd)
         if pid <= 0:
+            rejects.append(f'{hwnd} ({text!r}): no _NET_WM_PID')
             continue
         candidates, cmdline = _exe_candidates(pid)
+        if not candidates and not cmdline:
+            rejects.append(f'{hwnd} ({text!r}): pid {pid} is not resolvable in /proc')
 
         if exe_names:
             matched = _match_exe_names(candidates, exe_names)
             if matched is None:
+                rejects.append(f'{hwnd} ({text!r}): pid {pid} {[c[0] for c in candidates]} '
+                               f'does not match {exe_names}')
                 continue
             name, full_path = matched
         elif candidates:
@@ -312,11 +358,20 @@ def find_hwnd(title, exe_names, frame_width, frame_height, player_id=-1, class_n
         # Same >10px floor as upstream. It is also what discards Wine's 1x1 "Default IME"
         # helper toplevels, which share the game's pid and would otherwise tie on it.
         if width <= 10 or height <= 10:
+            rejects.append(f'{hwnd} ({text!r}): {width}x{height} is at or below the 10px floor')
             continue
         results.append((hwnd, full_path, width, height, x, y, text, '', 1.0))
 
     if not results:
+        global _last_no_match_log
+        now = time.time()
+        if toplevels and now - _last_no_match_log > _NO_MATCH_LOG_INTERVAL:
+            _last_no_match_log = now
+            logger.info(f'find_hwnd matched none of {toplevels} toplevel windows '
+                        f'(title={title!r} exe_names={exe_names} player_id={player_id}): '
+                        + '; '.join(rejects))
         return None, 0, None, 0, 0, 0, 0, []
+    _last_no_match_log = 0
 
     w_biggest = max(results, key=lambda r: r[2] * r[3])
     w_selected = next((r for r in results if 0 < selected_hwnd == r[0]), None)
