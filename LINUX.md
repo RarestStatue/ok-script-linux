@@ -17,7 +17,7 @@ BitBlt, WGC, DXGI, ADB, browser and NemuIPC backends), so Linux is one more back
 | 1 | `import ok` and every lazily-mapped symbol work on Linux | done |
 | 2 | `X11Window` — window discovery/geometry via python-xlib | done |
 | 3 | `X11CaptureMethod` — `XGetImage` + MIT-SHM | done |
-| 4 | `WinePostMessageInteraction` + the in-prefix `PostMessage` shim | done |
+| 4 | `WinePostMessageInteraction` + the in-prefix `PostMessage` shim | built; the shim reaches the game, whether the game *reacts* is unverified |
 
 Phase 1 made the tree *importable, startable and testable* on Linux. Phase 2 makes the
 window layer *real*: the app finds the game's X11 window, tracks its geometry, focus and
@@ -36,9 +36,15 @@ OK(config) -> DeviceManager -> X11Window -> find_hwnd -> do_start
 ```
 
 Capture was measured against Wuthering Waves running under Proton: 2560x1440 at
-4.5 ms/frame, live while the window was occluded. Reproduce the startup path with ok-ww's
-`tools/check_linux_startup.py` and the input path with ok-ww's `tools/check_shim.py` (both
-live in ok-ww: one needs ok-ww's config, the other the shim's C source and built exe).
+4.5 ms/frame, live while the window was occluded. Input reaches the game's process: a
+host-side `proton run` joins the wineserver of a game Steam launched inside its container,
+and the shim resolves the game's `UnrealWindow` and reports its exact client rect. Whether
+the game *acts* on a posted key is the port's last open question (PORT.md [GATE-2]) and
+needs a throwaway test account to answer safely — Wuthering Waves ships an anti-cheat.
+
+Reproduce the startup path with ok-ww's `tools/check_linux_startup.py` and the input path
+with ok-ww's `tools/check_shim.py` (both live in ok-ww: one needs ok-ww's config, the other
+the shim's C source and built exe).
 
 ## Rebasing onto a new upstream tag
 
@@ -258,7 +264,7 @@ already captures an occluded window, verified against the game with a window cov
 |---|---|
 | `ok/compat/proton_shim.py` | **new** — Steam library / `appmanifest` / `config_info` parsing, the shim's launch shapes (`proton run` and the SteamLinuxRuntime entry point), the handshake file, and the authenticated line client |
 | `ok/device/interaction_methods/wine_post_message.py` | **new** — `WinePostMessageInteraction`: `PostMessageInteraction` method for method, over the socket |
-| `tests/test_wine_post_message.py` | **new** — 60 tests: the Steam/Proton parsing against a fabricated tree, the protocol against a real loopback server, and the backend's semantics |
+| `tests/test_wine_post_message.py` | **new** — 61 tests: the Steam/Proton parsing against a fabricated tree, the protocol against a real loopback server, and the backend's semantics |
 | `ok/device/interaction_methods/base.py` | `get_cursor_pos()` / `set_cursor_pos()` on the interface, so task code stops calling `win32api` directly |
 | `ok/device/interaction_methods/__init__.py` | exports `WinePostMessageInteraction` |
 | `ok/device/DeviceManager.py` | the `'WinePostMessage'` branch in **both** selection ladders — the constructor's and `set_interaction`'s, which the GUI picker uses |
@@ -326,9 +332,9 @@ quiet to level 2, which suppresses the final `N failed, M passed` line entirely.
 still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
 crashed run and is not.
 
-Baseline: **549 passed, 6 failed, 1 skipped, 16 subtests passed** (556 collected, Python
+Baseline: **552 passed, 6 failed, 1 skipped, 16 subtests passed** (559 collected, Python
 3.12) — 376 of those passes predate Phase 2 (`tests/test_x11_window.py`, 74), Phase 3
-(`tests/test_x11_capture.py`, 41) and Phase 4 (`tests/test_wine_post_message.py`, 60).
+(`tests/test_x11_capture.py`, 41) and Phase 4 (`tests/test_wine_post_message.py`, 61).
 Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
 failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
 unparented and outlived its widget, firing `og.executor.current_task` into whatever test

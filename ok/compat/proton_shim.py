@@ -209,7 +209,15 @@ def find_runtime_entry_point(libraries):
                 found.append((name, entry))
     if not found:
         return None
-    return sorted(found)[-1][1]
+
+    # `SteamLinuxRuntime_4` is the one the game's toolmanifest asks for; `_soldier` and
+    # `_sniper` are the older named runtimes, and plain lexicographic order puts those
+    # last ('s' > '4'). Rank the numbered ones first, highest number first.
+    def rank(entry):
+        suffix = entry[0][len(RUNTIME_DIR_PREFIX):].lstrip('_')
+        return (1, int(suffix)) if suffix.isdigit() else (0, 0)
+
+    return max(found, key=rank)[1]
 
 
 def resolve_steam_game(appid=WUWA_APPID, exe_name=WUWA_EXE, environ=None):
@@ -457,7 +465,7 @@ def start_shim(game, shim_exe=None, exe_name=WUWA_EXE, hwnd_class='UnrealWindow'
     shim_exe = find_shim_exe(shim_exe)
     if not shim_exe:
         raise ShimError(f'{SHIM_EXE_NAME} was not found; build it with '
-                        f'`x86_64-w64-mingw32-gcc -O2 -s -o shim/{SHIM_EXE_NAME} '
+                        f'`x86_64-w64-mingw32-gcc -O2 -s -mwindows -o shim/{SHIM_EXE_NAME} '
                         f'shim/okww-input-shim.c -lws2_32` or set OKWW_INPUT_SHIM')
     install_shim(game, shim_exe)
 

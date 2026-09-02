@@ -133,6 +133,16 @@ class TestSteamResolution(unittest.TestCase):
         self.assertTrue(game.runtime_entry_point.endswith('SteamLinuxRuntime_4/_v2-entry-point'))
         self.assertIsNone(find_runtime_entry_point([self.library]))
 
+    def test_the_numbered_runtime_wins_over_the_older_named_ones(self):
+        """This machine has `_soldier` installed too, and 's' sorts after '4'."""
+        common = os.path.join(self.steam, 'steamapps', 'common')
+        for name in ('SteamLinuxRuntime_soldier', 'SteamLinuxRuntime_sniper'):
+            os.makedirs(os.path.join(common, name), exist_ok=True)
+            with open(os.path.join(common, name, '_v2-entry-point'), 'w') as handle:
+                handle.write('#!/bin/sh\n')
+        entry = find_runtime_entry_point([self.steam])
+        self.assertTrue(entry.endswith('SteamLinuxRuntime_4/_v2-entry-point'), entry)
+
     def test_a_missing_game_says_what_to_do_rather_than_returning_none(self):
         with self.assertRaises(ShimError) as caught:
             resolve_steam_game(appid='424242', environ=self.environ)
