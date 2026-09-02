@@ -1073,8 +1073,9 @@ class TestUpstreamDrift(unittest.TestCase):
         self.assertEqual({'a', 'b', 'c', 'd'}, self._init_attributes(node))
 
     def test_the_linux_modules_call_no_win32(self):
-        for path in ('ok/compat/x11.py', 'ok/compat/window_x11.py',
-                     'ok/device/capture_methods/x11_window.py'):
+        for path in ('ok/compat/x11.py', 'ok/compat/window_x11.py', 'ok/compat/xshm.py',
+                     'ok/device/capture_methods/x11_window.py',
+                     'ok/device/capture_methods/x11_capture.py'):
             source = (REPO / path).read_text(encoding='utf-8')
             tree = ast.parse(source)
             imported = {node.names[0].name.split('.')[0]

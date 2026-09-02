@@ -26,6 +26,7 @@ from ok.device.capture_methods.nemu_ipc import NemuIpcCaptureMethod
 from ok.device.capture_methods.types import ColorChannel, ImageShape, decimal, is_digit, is_valid_hwnd
 from ok.device.capture_methods.update import get_capture, get_win_graphics_capture, update_capture_method
 from ok.device.capture_methods.windows_graphics import WindowsGraphicsCaptureMethod
+from ok.device.capture_methods.x11_capture import X11CaptureMethod, x11_capture_available
 
 # On Linux the Win32 window layer imports (the win32 stub sees to that) but cannot run, so
 # shadow it with the X11 one. `HwndWindow` is rebound rather than renamed because that is

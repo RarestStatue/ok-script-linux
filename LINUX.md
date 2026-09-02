@@ -16,26 +16,27 @@ BitBlt, WGC, DXGI, ADB, browser and NemuIPC backends), so Linux is one more back
 | 0 | Fork, upstream remote, rebase-friendly layout | done |
 | 1 | `import ok` and every lazily-mapped symbol work on Linux | done |
 | 2 | `X11Window` — window discovery/geometry via python-xlib | done |
-| 3 | `X11CaptureMethod` — `XGetImage` + MIT-SHM | not started |
+| 3 | `X11CaptureMethod` — `XGetImage` + MIT-SHM | done |
 | 4 | `WinePostMessageInteraction` + the in-prefix `PostMessage` shim | not started |
 
 Phase 1 made the tree *importable, startable and testable* on Linux. Phase 2 makes the
 window layer *real*: the app finds the game's X11 window, tracks its geometry, focus and
-minimized state, mutes it in the background, and hands `DeviceManager` a PC device — so
-startup now runs all the way to capture-method selection.
+minimized state, mutes it in the background, and hands `DeviceManager` a PC device. Phase 3
+makes the pixels real: `X11CaptureMethod` grabs the game's own window through MIT-SHM.
 
 Where startup stops today, with ok-ww's config on Linux:
 
 ```
 OK(config) -> DeviceManager -> X11Window -> find_hwnd -> do_start
-           -> update_capture_method(['WGC', 'BitBlt_RenderFull'])
-           -> BitBlt, which imports here but can never produce a frame
+           -> update_capture_method(['X11', 'X11_Composite'])
+           -> X11CaptureMethod, which produces real frames of the game
+           -> PostMessageInteraction, which cannot post into the Wine window  <- Phase 4
 ```
 
-Everything up to and including capture *selection* runs. What is missing is a capture
-*backend* that works — Phase 3 — and the input backend, Phase 4. Reproduce with ok-ww's
-`tools/check_linux_startup.py`, the Phase 2 exit gate (it lives in ok-ww because it needs
-ok-ww's config).
+Capture works end to end and was measured against Wuthering Waves running under Proton:
+2560x1440 at 4.5 ms/frame, live while the window was occluded. What is missing is the input
+backend, Phase 4. Reproduce the startup path with ok-ww's `tools/check_linux_startup.py`
+(it lives in ok-ww because it needs ok-ww's config).
 
 ## Rebasing onto a new upstream tag
 
@@ -185,6 +186,50 @@ gives one X toplevel per game, so there is no child/top window to report. All fo
 consumers handle the empty list. `real_width` / `real_height` are the window's size, never
 0 — zeros give `DeviceManager` a `0x0` device and freeze change detection.
 
+## What Phase 3 added
+
+| File | Change |
+|---|---|
+| `ok/compat/xshm.py` | **new** — the pixel path: libX11/libXext/libXcomposite through `ctypes`, MIT-SHM with an `XGetImage` fallback, an error handler that keeps a protocol error from exiting the process, and BGRA→BGR unpacking |
+| `ok/device/capture_methods/x11_capture.py` | **new** — `X11CaptureMethod`, the crop rectangle, and `x11_capture_available()` |
+| `tests/test_x11_capture.py` | **new** — 34 tests: pixel-format unpacking over hand-made `XImage` structs, the crop contract against `get_capture_origin`, the selection branch, and live grabs of a real window through both the shared-memory and the wire path |
+| `ok/device/capture_methods/update.py` | the `X11` / `X11_Composite` branch, next to WGC and BitBlt |
+| `ok/device/capture_methods/__init__.py` | exports `X11CaptureMethod` |
+
+`python-xlib` owns the window layer and `ctypes` owns the pixel layer, on separate display
+connections. That split is forced: python-xlib has no MIT-SHM binding at any version, and
+`XShmGetImage` is 6.6x cheaper than `XGetImage` at 2560x1440 (4.5 ms against 29.7 ms,
+measured against the game).
+
+Five things are load-bearing:
+
+* **Xlib's default error handler calls `exit(1)`.** A window that dies between the poll
+  thread reading its geometry and the capture thread grabbing it is a routine `BadWindow`;
+  without `XSetErrorHandler` the first one takes the app down. The handler is
+  process-global rather than per-display, which is only acceptable because nothing else
+  here talks to libX11 — PySide6 uses xcb, python-xlib speaks the protocol itself.
+* **The returned frame is a copy, made by `cv2.cvtColor`.** The shared segment is
+  overwritten by the next grab while `TaskExecutor` still holds the previous frame. At
+  1080p: `arr[:, :, :3].copy()` 10.10 ms, `np.ascontiguousarray` 9.69 ms, `cv2.cvtColor`
+  0.15 ms.
+* **A grab from a Pixmap comes back with the image's RGB masks zeroed.** Both `XGetImage`
+  and `XShmGetImage` fill them in from the reply's visual id, and a pixmap has no visual —
+  so the composite path has to carry the window's own visual masks down to the unpacking.
+* **The composite path re-names the pixmap on every grab.** A name is a handle onto the
+  backing pixmap *as it is now*, and a client that presents by flipping (DXVK, for the
+  game) gets a new one per frame. Cached, six grabs 0.25 s apart differed by exactly 0.0 —
+  a frozen picture that looks like a working capture. Re-named, 28-57. It costs 3.6 → 5.4
+  ms/frame, which is what the direct path costs anyway.
+* **`is_minimized()` answers True for a window id that no longer exists** (its last resort
+  is "not viewable"), so the "the game window is minimized" exception is gated on
+  `x11.exists()` first. Otherwise a game that exited raised the one message a user cannot
+  act on, on every poll.
+
+`X11` grabs the window directly and `X11_Composite` grabs an XComposite offscreen pixmap.
+The second is for a plain non-compositing X server, where an occluded window's pixels are
+genuinely not in the framebuffer; under Xwayland or any compositing WM the direct path
+already captures an occluded window, verified against the game with a window covering it.
+
 ## Test baseline on Linux
 
 `opencv-python` must be installed alongside the extras. ~14 modules (`ok/util/color.py`,
@@ -205,8 +250,9 @@ quiet to level 2, which suppresses the final `N failed, M passed` line entirely.
 still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
 crashed run and is not.
 
-Baseline: **438 passed, 6 failed, 1 skipped, 10 subtests passed** (454 collected, Python
-3.12) — 376 of those passes predate Phase 2, which added `tests/test_x11_window.py`.
+Baseline: **484 passed, 6 failed, 1 skipped, 10 subtests passed** (491 collected, Python
+3.12) — 376 of those passes predate Phase 2 (`tests/test_x11_window.py`, 74) and Phase 3
+(`tests/test_x11_capture.py`, 34).
 Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
 failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
 unparented and outlived its widget, firing `og.executor.current_task` into whatever test
@@ -224,8 +270,9 @@ The six failures are Windows-only by construction, not port regressions:
 None sit on the game path. Re-check this list after a rebase; a *new* failure outside it is
 a regression. CI deselects exactly these six by node id — keep the two lists in step.
 
-Thirteen of the 450 are live X11 tests: they create a real window and drive it through a real
-server. With no `DISPLAY` they skip (`61 passed, 13 skipped` for that file alone), so CI runs
-the suite under `xvfb-run`. Xvfb has no window manager, and the four tests that need one —
-iconify, de-iconify-on-activate, and the two `resize_window` ones — skip themselves there;
-they run in full on a desktop session.
+Twenty-three of the 484 are live X11 tests: they create a real window and drive it through a
+real server — 13 in `test_x11_window.py` (`61 passed, 13 skipped` for that file with no
+`DISPLAY`) and 10 in `test_x11_capture.py` (`24 passed, 10 skipped`). So CI runs the suite
+under `xvfb-run`. Xvfb has no window manager, and the five tests that need one — iconify,
+de-iconify-on-activate, the two `resize_window` ones, and the capture layer's iconify test —
+skip themselves there; they run in full on a desktop session.

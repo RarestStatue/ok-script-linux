@@ -7,6 +7,11 @@ from ok.device.capture_methods import bitblt
 from ok.device.capture_methods.bitblt import BitBltCaptureMethod, ForegroundBitBltCaptureMethod
 from ok.device.capture_methods.desktop_duplication import DesktopDuplicationCaptureMethod
 from ok.device.capture_methods.windows_graphics import WindowsGraphicsCaptureMethod
+# Linux capture. The module imports on every platform -- libX11 is loaded lazily, on the
+# first grab -- so this needs no platform guard and the branch below is unreachable on
+# Windows anyway: nothing puts 'X11' in a Windows `capture_method` list.
+from ok.device.capture_methods import x11_capture
+from ok.device.capture_methods.x11_capture import X11CaptureMethod, x11_capture_available
 
 logger = Logger.get_logger(__name__)
 
@@ -34,6 +39,17 @@ def update_capture_method(config, capture_method, hwnd, exit_event=None, selecte
                 if foreground_capture := get_capture(capture_method, ForegroundBitBltCaptureMethod, hwnd, exit_event):
                     logger.info(f'use {method_name} capture')
                     return foreground_capture
+            elif method_name in ('X11', 'X11_Composite'):
+                if not x11_capture_available():
+                    logger.info(f'{method_name} is unavailable on this system, trying the next method')
+                    continue
+                # As `bitblt.render_full`: the two names are one class with one flag, and
+                # `get_capture` reuses the live object, so the flag cannot be a constructor
+                # argument.
+                x11_capture.use_composite = (method_name == 'X11_Composite')
+                if x11 := get_capture(capture_method, X11CaptureMethod, hwnd, exit_event):
+                    logger.info(f'use {method_name} capture')
+                    return x11
             elif method_name == 'DXGI':
                 if dxgi_capture := get_capture(capture_method, DesktopDuplicationCaptureMethod, hwnd, exit_event):
                     return dxgi_capture
