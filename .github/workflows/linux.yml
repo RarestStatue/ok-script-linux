@@ -28,10 +28,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      # `opencv-python` is deliberately not a declared dependency -- upstream's
+      # test_package_metadata asserts no profile mentions opencv, so a headless consumer can
+      # pick opencv-python-headless -- but ~14 modules import cv2 at module scope. Without it
+      # the lazy-import sweep reports 36/70 and the suite collects 20 errors, all
+      # `No module named 'cv2'`, which reads exactly like a port regression and is not one.
+      # Keep this line in step with LINUX.md's repro command.
       - name: Install with every extra
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[web,default,qt,adb,ocr,dev]' pytest-qt
+          pip install -e '.[web,default,qt,adb,ocr,dev]' pytest-qt opencv-python
 
       - name: Qt runtime libraries
         run: |
