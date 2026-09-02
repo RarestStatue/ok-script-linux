@@ -429,6 +429,10 @@ def activate(wid):
 
     KDE and GNOME both apply focus-stealing prevention, so a refusal is expected rather
     than exceptional; upstream's ``bring_to_front`` already treats False as recoverable.
+
+    Mapping first is the ICCCM way to de-iconify (4.1.4: a client returns a window to the
+    normal state with ``MapWindow``), and it stands in for upstream's
+    ``ShowWindow(SW_RESTORE)``. It is a no-op on an already-mapped window.
     """
     if not wid:
         return False
@@ -438,6 +442,7 @@ def activate(wid):
         import Xlib.protocol.event
         win = _window(d, wid)
         root = d.screen().root
+        win.map()
         event = Xlib.protocol.event.ClientMessage(
             window=win,
             client_type=d.get_atom('_NET_ACTIVE_WINDOW'),

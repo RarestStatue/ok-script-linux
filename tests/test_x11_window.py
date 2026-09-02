@@ -750,6 +750,29 @@ class TestLiveX11(unittest.TestCase):
         self._wait_for(lambda: not x11.is_minimized(self.wid))
         self.assertFalse(x11.is_minimized(self.wid))
 
+    def test_activate_deiconifies_like_show_window_restore(self):
+        """Upstream's `bring_to_front` restores a minimized window before raising it."""
+        from Xlib import X
+        from Xlib.protocol import event
+        from ok.compat import x11
+
+        if not _wm_present():
+            self.skipTest('iconify is a request to a window manager; none is running')
+
+        message = event.ClientMessage(window=self.window,
+                                      client_type=self.display.get_atom('WM_CHANGE_STATE'),
+                                      data=(32, [x11.ICONIC_STATE, 0, 0, 0, 0]))
+        self.display.screen().root.send_event(
+            message, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
+        self.display.sync()
+        if not self._wait_for(lambda: x11.is_minimized(self.wid)):
+            self.skipTest('the window manager did not iconify the test window')
+
+        self.assertTrue(x11.activate(self.wid))
+        self._wait_for(lambda: not x11.is_minimized(self.wid))
+
+        self.assertFalse(x11.is_minimized(self.wid))
+
     def test_resize_window_reaches_the_requested_size(self):
         from ok.util import window
 
