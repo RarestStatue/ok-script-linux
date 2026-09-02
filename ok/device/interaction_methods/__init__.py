@@ -9,3 +9,6 @@ from ok.device.interaction_methods.post_message import PostMessageInteraction
 from ok.device.interaction_methods.pydirect import PyDirectInteraction
 from ok.device.interaction_methods.pynput import PynputInteraction
 from ok.device.interaction_methods.swipe import insert_swipe
+# Linux input, through a shim in the game's Wine prefix. Pure Python plus sockets, so the
+# module imports on every platform; nothing selects it unless a config lists it.
+from ok.device.interaction_methods.wine_post_message import WinePostMessageInteraction

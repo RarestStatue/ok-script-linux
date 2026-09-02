@@ -9,7 +9,8 @@ import numpy as np
 from ok.device.capture import HwndWindow, BrowserCaptureMethod, update_capture_method, NemuIpcCaptureMethod, \
     ADBCaptureMethod
 from ok.device.interaction import PostMessageInteraction, GenshinInteraction, ForegroundPostMessageInteraction, \
-    PynputInteraction, PyDirectInteraction, BrowserInteraction, ADBInteraction
+    PynputInteraction, PyDirectInteraction, BrowserInteraction, ADBInteraction, \
+    WinePostMessageInteraction
 from ok.core.events import communicate
 from ok.util.collection import parse_ratio
 from ok.util.config import Config
@@ -106,6 +107,8 @@ class DeviceManager:
 
             if selected_interaction == 'PostMessage':
                 self.win_interaction_class = PostMessageInteraction
+            elif selected_interaction == 'WinePostMessage':
+                self.win_interaction_class = WinePostMessageInteraction
             elif selected_interaction == 'Genshin':
                 self.win_interaction_class = GenshinInteraction
             elif selected_interaction == 'ForegroundPostMessage':
@@ -607,6 +610,8 @@ class DeviceManager:
             self.config['interaction'] = interaction_name
             if interaction == 'PostMessage':
                 self.win_interaction_class = PostMessageInteraction
+            elif interaction == 'WinePostMessage':
+                self.win_interaction_class = WinePostMessageInteraction
             elif interaction == 'Genshin':
                 self.win_interaction_class = GenshinInteraction
             elif interaction == 'ForegroundPostMessage':

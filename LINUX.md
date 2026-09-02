@@ -17,26 +17,28 @@ BitBlt, WGC, DXGI, ADB, browser and NemuIPC backends), so Linux is one more back
 | 1 | `import ok` and every lazily-mapped symbol work on Linux | done |
 | 2 | `X11Window` — window discovery/geometry via python-xlib | done |
 | 3 | `X11CaptureMethod` — `XGetImage` + MIT-SHM | done |
-| 4 | `WinePostMessageInteraction` + the in-prefix `PostMessage` shim | not started |
+| 4 | `WinePostMessageInteraction` + the in-prefix `PostMessage` shim | done |
 
 Phase 1 made the tree *importable, startable and testable* on Linux. Phase 2 makes the
 window layer *real*: the app finds the game's X11 window, tracks its geometry, focus and
 minimized state, mutes it in the background, and hands `DeviceManager` a PC device. Phase 3
 makes the pixels real: `X11CaptureMethod` grabs the game's own window through MIT-SHM.
+Phase 4 makes input real: `WinePostMessageInteraction` writes to a small C program running
+*inside* the game's Proton prefix, which does the `PostMessageW`.
 
-Where startup stops today, with ok-ww's config on Linux:
+With ok-ww's config on Linux, startup now reaches:
 
 ```
 OK(config) -> DeviceManager -> X11Window -> find_hwnd -> do_start
            -> update_capture_method(['X11', 'X11_Composite'])
            -> X11CaptureMethod, which produces real frames of the game
-           -> PostMessageInteraction, which cannot post into the Wine window  <- Phase 4
+           -> WinePostMessageInteraction -> okww-input-shim.exe -> the game's HWND
 ```
 
-Capture works end to end and was measured against Wuthering Waves running under Proton:
-2560x1440 at 4.5 ms/frame, live while the window was occluded. What is missing is the input
-backend, Phase 4. Reproduce the startup path with ok-ww's `tools/check_linux_startup.py`
-(it lives in ok-ww because it needs ok-ww's config).
+Capture was measured against Wuthering Waves running under Proton: 2560x1440 at
+4.5 ms/frame, live while the window was occluded. Reproduce the startup path with ok-ww's
+`tools/check_linux_startup.py` and the input path with ok-ww's `tools/check_shim.py` (both
+live in ok-ww: one needs ok-ww's config, the other the shim's C source and built exe).
 
 ## Rebasing onto a new upstream tag
 
@@ -250,6 +252,60 @@ The second is for a plain non-compositing X server, where an occluded window's p
 genuinely not in the framebuffer; under Xwayland or any compositing WM the direct path
 already captures an occluded window, verified against the game with a window covering it.
 
+## What Phase 4 added
+
+| File | Change |
+|---|---|
+| `ok/compat/proton_shim.py` | **new** — Steam library / `appmanifest` / `config_info` parsing, the shim's launch shapes (`proton run` and the SteamLinuxRuntime entry point), the handshake file, and the authenticated line client |
+| `ok/device/interaction_methods/wine_post_message.py` | **new** — `WinePostMessageInteraction`: `PostMessageInteraction` method for method, over the socket |
+| `tests/test_wine_post_message.py` | **new** — 60 tests: the Steam/Proton parsing against a fabricated tree, the protocol against a real loopback server, and the backend's semantics |
+| `ok/device/interaction_methods/base.py` | `get_cursor_pos()` / `set_cursor_pos()` on the interface, so task code stops calling `win32api` directly |
+| `ok/device/interaction_methods/__init__.py` | exports `WinePostMessageInteraction` |
+| `ok/device/DeviceManager.py` | the `'WinePostMessage'` branch in **both** selection ladders — the constructor's and `set_interaction`'s, which the GUI picker uses |
+
+The shim itself (`shim/okww-input-shim.c`, ~450 lines of C, built with mingw) lives in
+ok-ww, next to its build instructions and the prebuilt exe.
+
+Why a program inside the prefix at all: `PostMessage` delivers to an **unfocused** window,
+which is what background play means, and nothing on the Linux side can do that —
+`XSendEvent` is focus-bound and XTEST is global (it moves the real keyboard). The heavy
+half of the app stays native: only a few KB of input logic runs under Wine.
+
+Six things are load-bearing:
+
+* **The hot path is fire-and-forget, in both directions.** Upstream's `post()` swallows
+  every error and returns nothing, so no caller ever reads a result. The shim replies to
+  `HELLO`/`FINDWIN`/`GEOM`/`GETCURSOR`/`VKKEYSCAN`/`PING`/`STATS`/`QUIT` and to nothing
+  else — a reply nobody reads would fill the socket buffer and eventually block the shim
+  mid-combat, and a round-trip per keypress would sit inside the combat loop and inside
+  `swipe`, which issues up to 100 `move()` calls back to back.
+* **Every reply carries its command as a tag** (`GEOM 0 0 2560 1440`, `ERR GEOM notfound`).
+  Without it, one late or unsolicited line pairs every later answer with the wrong
+  question, silently, for the rest of the session.
+* **`MapVirtualKey` runs inside Wine.** The scan code in the keyboard lparam has to be the
+  one the game's Unreal input layer expects, so it cannot be precomputed on Linux.
+* **The Proton build comes from the prefix's own `config_info`.** Launching the shim with a
+  *different* build than the game was last run with rewrites the prefix ("Upgrading prefix
+  from X to Y"). The tool directory is recovered by walking up from one of the file's
+  absolute paths to the directory holding `proton`, not by stripping a fixed suffix.
+* **The connection is maintained by a thread, not by the sender.** ok-ww is normally
+  started before the game; the first attempt fails with "the game is not running", and a
+  link that only retried on the next `send` would drop the first seconds of play.
+* **Two upstream bugs are fixed in the Linux backend and left alone on Windows.**
+  `swipe`'s `steps = int(duration / 100)` is 0 at the default `duration=3` and then divides
+  by it; `mouse_up` releases at `self.mouse_pos`, which is `(0, 0)` for the life of the
+  object, so upstream ends every drag at client (0, 0). A third — `right_click` opening
+  with `super().right_click(...)`, which `BaseInteraction` does not define — is dead on
+  both platforms, because `Task.right_click` routes through `click(key='right')`.
+
+### Security
+
+The shim can synthesize input into the game, so it is reachable only from this machine and
+only by this user: the listener binds `127.0.0.1` on a kernel-assigned port, the first line
+of every connection must present a 32-byte random token, and that token is published only
+through a handshake file inside the prefix that the Linux side pre-creates at mode 0600 and
+truncates in place. Anything else is dropped without a reply.
+
 ## Test baseline on Linux
 
 `opencv-python` must be installed alongside the extras. ~14 modules (`ok/util/color.py`,
@@ -270,9 +326,9 @@ quiet to level 2, which suppresses the final `N failed, M passed` line entirely.
 still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
 crashed run and is not.
 
-Baseline: **491 passed, 6 failed, 1 skipped, 16 subtests passed** (498 collected, Python
-3.12) — 376 of those passes predate Phase 2 (`tests/test_x11_window.py`, 74) and Phase 3
-(`tests/test_x11_capture.py`, 41).
+Baseline: **549 passed, 6 failed, 1 skipped, 16 subtests passed** (556 collected, Python
+3.12) — 376 of those passes predate Phase 2 (`tests/test_x11_window.py`, 74), Phase 3
+(`tests/test_x11_capture.py`, 41) and Phase 4 (`tests/test_wine_post_message.py`, 60).
 Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
 failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
 unparented and outlived its widget, firing `og.executor.current_task` into whatever test
