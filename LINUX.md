@@ -121,7 +121,7 @@ import sweep.
 | `ok/compat/x11.py` | **new** — the python-xlib window layer: enumeration, `_NET_WM_PID`, geometry, focus, minimized state, RandR monitors, activate, resize. Nothing in it raises; every entry point has a documented empty return |
 | `ok/compat/window_x11.py` | **new** — the Linux bodies of the `ok.util.window` contracts (`find_hwnd`, `get_window_bounds`, `is_foreground_window`, `resize_window`, `find_all_visible_windows`, `show_title_bar`, `get_exe_by_hwnd`, `is_window_minimized`) |
 | `ok/device/capture_methods/x11_window.py` | **new** — `X11Window`, plus `get_monitors_bounds` and the pactl-backed `get_mute_state` / `set_mute_state` |
-| `tests/test_x11_window.py` | **new** — 42 tests: tuple-shape contracts, the two semantics the plan got wrong first time, a drift gate over the copied constructor, and live tests against a real X server |
+| `tests/test_x11_window.py` | **new** — 43 tests: tuple-shape contracts, the two semantics the plan got wrong first time, a drift gate over the copied constructor, and live tests against a real X server |
 | `ok/device/capture_methods/__init__.py` | rebinds `HwndWindow` to `X11Window` on Linux, and shadows the five helpers line 21 imports from `hwnd_window` |
 | `ok/util/window.py` | imports the X11 bodies over the Win32 ones on non-Windows, at the bottom of the file |
 | `ok/core/screenshot.py` | the annotation font is looked up per platform; `os.environ['WINDIR']` is a `KeyError` here |
@@ -174,7 +174,7 @@ quiet to level 2, which suppresses the final `N failed, M passed` line entirely.
 still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
 crashed run and is not.
 
-Baseline: **418 passed, 6 failed, 1 skipped, 10 subtests passed** (434 collected, Python
+Baseline: **419 passed, 6 failed, 1 skipped, 10 subtests passed** (435 collected, Python
 3.12) — 376 of those passes predate Phase 2, which added `tests/test_x11_window.py`.
 Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
 failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
@@ -193,7 +193,7 @@ The six failures are Windows-only by construction, not port regressions:
 None sit on the game path. Re-check this list after a rebase; a *new* failure outside it is
 a regression. CI deselects exactly these six by node id — keep the two lists in step.
 
-Seven of the 418 are live X11 tests: they create a real window and drive it through a real
+Eight of the 419 are live X11 tests: they create a real window and drive it through a real
 server. With no `DISPLAY` they skip (`35 passed, 7 skipped` for that file alone), so CI runs
 the suite under `xvfb-run`. Xvfb has no window manager, and the three tests that need one —
 iconify, activation, resize — skip themselves there; they run in full on a desktop session.
