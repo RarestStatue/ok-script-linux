@@ -23,6 +23,7 @@ import pathlib
 import sys
 import threading
 import time
+import types
 import unittest
 import unittest.mock
 
@@ -320,6 +321,108 @@ class TestFindHwnd(unittest.TestCase):
 
         self.assertEqual(0x1400001, self.run_find(fake, candidates, exe_names=['dnplayer.exe'], player_id=3)[1])
         self.assertEqual(0, self.run_find(fake, candidates, exe_names=['dnplayer.exe'], player_id=5)[1])
+
+
+@skip_on_windows
+class TestFocusClientWindow(unittest.TestCase):
+    """[P2-14] `is_active` must see the client, not the reparenting WM's frame.
+
+    Measured on a nested `Xwayland :9` with the client reparented into an
+    override-redirect frame and the input focus set on the client: `get_focus_toplevel`
+    returned the frame, so `is_active(client)` was False while `XGetInputFocus` named the
+    client, `is_foreground_window` was False for a focused game, and `x11.activate` spent
+    its whole 0.5s timeout to report a refusal of focus it had been granted. Unit-tested
+    rather than driven live because the fallback only runs on a WM that publishes no
+    `_NET_ACTIVE_WINDOW`, and this desktop (KWin) and CI (Xvfb, no WM) are neither.
+    """
+
+    class _Window:
+        def __init__(self, wid, parent=None, wm_state=False, children=(), raises=False):
+            self.id = wid
+            self.parent = parent
+            self.wm_state = wm_state
+            self.children = list(children)
+            self.raises = raises
+
+    class _Display:
+        """The three calls `_client_window` makes: get_atom, create_resource_object, query_tree."""
+
+        def __init__(self, windows):
+            self.windows = {w.id: w for w in windows}
+
+        def get_atom(self, name):
+            return 39 if name == 'WM_STATE' else 1
+
+        def create_resource_object(self, kind, wid):
+            # The root and anything outside the fixture behave as a bare window.
+            window = self.windows.get(wid) or TestFocusClientWindow._Window(wid)
+            display = self
+
+            class _Resource:
+                id = wid
+
+                def get_full_property(self, atom, kind_):
+                    if window.raises:
+                        raise RuntimeError('BadWindow: it went away mid-walk')
+                    # SimpleNamespace, not Mock: `parent` is a reserved Mock kwarg and a
+                    # `Mock(parent=...)` silently hands back the wrong object below.
+                    return types.SimpleNamespace(value=[1, 0]) if window.wm_state else None
+
+                def query_tree(self):
+                    if window.raises:
+                        raise RuntimeError('BadWindow: it went away mid-walk')
+                    return types.SimpleNamespace(
+                        parent=None if window.parent is None else display.create_resource_object('window', window.parent),
+                        children=[display.create_resource_object('window', c) for c in window.children])
+
+            return _Resource()
+
+    ROOT = 0x100
+
+    def test_focus_on_an_input_child_resolves_to_the_client(self):
+        from ok.compat import x11
+        display = self._Display([
+            self._Window(0x1400002, parent=0x1400001),
+            self._Window(0x1400001, parent=self.ROOT, wm_state=True, children=[0x1400002]),
+        ])
+
+        self.assertEqual(0x1400001, x11._client_window(display, 0x1400002, self.ROOT))
+
+    def test_a_reparented_client_is_not_reported_as_its_frame(self):
+        """The regression: the frame is the root's child, so the old walk returned it."""
+        from ok.compat import x11
+        display = self._Display([
+            self._Window(0x1400001, parent=0x2000001, wm_state=True),
+            self._Window(0x2000001, parent=self.ROOT, children=[0x1400001]),
+        ])
+
+        self.assertEqual(0x1400001, x11._client_window(display, 0x1400001, self.ROOT))
+
+    def test_a_wm_that_focuses_the_frame_still_resolves_to_the_client(self):
+        """One level of descent: the frame carries no WM_STATE, its child does."""
+        from ok.compat import x11
+        display = self._Display([
+            self._Window(0x2000001, parent=self.ROOT, children=[0x1400001]),
+            self._Window(0x1400001, parent=0x2000001, wm_state=True),
+        ])
+
+        self.assertEqual(0x1400001, x11._client_window(display, 0x2000001, self.ROOT))
+
+    def test_with_no_wm_state_anywhere_the_root_child_is_the_answer(self):
+        """A bare X server with no window manager, which is also what CI runs under."""
+        from ok.compat import x11
+        display = self._Display([
+            self._Window(0x1400002, parent=0x1400001),
+            self._Window(0x1400001, parent=self.ROOT, children=[0x1400002]),
+        ])
+
+        self.assertEqual(0x1400001, x11._client_window(display, 0x1400002, self.ROOT))
+
+    def test_a_window_that_dies_mid_walk_is_zero_not_an_exception(self):
+        from ok.compat import x11
+        display = self._Display([self._Window(0x1400001, parent=self.ROOT, raises=True)])
+
+        self.assertEqual(0, x11._client_window(display, 0x1400001, self.ROOT))
 
 
 @skip_on_windows

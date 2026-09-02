@@ -405,31 +405,59 @@ def get_active_window():
         return 0
 
 
-def get_focus_toplevel():
-    """``XGetInputFocus`` walked up to the toplevel, for WMs that do not set EWMH focus.
+def _client_window(d, wid, root_id):
+    """The *client* window at or above ``wid``, or the root's child, or 0. Never raises.
 
-    A reparenting WM hands focus to a frame or an input-only child, so the raw id rarely
-    equals the client window; walking to the child of the root is what makes it comparable.
+    ICCCM's answer to "which client does this window belong to" is ``WM_STATE``: the WM
+    sets it on the client window and on nothing else, which is what ``XmuClientWindow``
+    looks for. Focus almost never lands on the client itself -- a toolkit gives it to an
+    input child, and a *reparenting* WM puts the client inside a frame -- so the search
+    walks up from ``wid`` and returns the first window carrying it.
+
+    Walking all the way to the root's child instead returned the **frame** under a
+    reparenting WM, so ``is_active()`` was False for a window that held the input focus
+    [P2-14]. One level of descent covers the other half of that shape, a WM that focuses
+    the frame rather than the client.
+
+    The root-child fallback is the right answer when nothing in the branch carries
+    ``WM_STATE`` at all: a bare X server with no window manager, which is also CI.
     """
+    root_child = 0
+    for _ in range(16):
+        if not wid or wid == root_id:
+            break
+        try:
+            if _prop(d, wid, 'WM_STATE') is not None:
+                return int(wid)
+            tree = _window(d, wid).query_tree()
+        except Exception:
+            return 0
+        if tree.parent is None or tree.parent == 0:
+            break
+        parent_id = tree.parent if isinstance(tree.parent, int) else tree.parent.id
+        if parent_id == root_id:
+            root_child = int(wid)
+            break
+        wid = parent_id
+    if root_child:
+        try:
+            for child in _window(d, root_child).query_tree().children:
+                if _prop(d, child.id, 'WM_STATE') is not None:
+                    return int(child.id)
+        except Exception:
+            pass
+    return root_child
+
+
+def get_focus_toplevel():
+    """``XGetInputFocus`` resolved to the client window, for WMs that set no EWMH focus."""
 
     def run(d):
         import Xlib.X
         focus = d.get_input_focus().focus
         if focus in (Xlib.X.PointerRoot, Xlib.X.NONE, 0) or isinstance(focus, int):
             return 0
-        root_id = d.screen().root.id
-        wid = focus.id
-        for _ in range(16):
-            if not wid or wid == root_id:
-                return 0
-            tree = _window(d, wid).query_tree()
-            if tree.parent is None or tree.parent == 0:
-                return 0
-            parent_id = tree.parent if isinstance(tree.parent, int) else tree.parent.id
-            if parent_id == root_id:
-                return int(wid)
-            wid = parent_id
-        return 0
+        return _client_window(d, focus.id, d.screen().root.id)
 
     return _call(run, 0, 'focus_toplevel') or 0
 
