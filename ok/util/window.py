@@ -473,3 +473,33 @@ def find_all_visible_windows():
         
     win32gui.EnumWindows(callback, None)
     return windows
+
+
+# --- Linux ------------------------------------------------------------------------------
+# Everything above is Win32. On Linux it *imports* (the win32 stub covers `ctypes.WinDLL`
+# at line 18 and the `win32*` modules), but the bodies that call into user32 would raise,
+# and this module is what the entire device layer -- DeviceManager, HwndWindow, browser.py,
+# update.py, desktop_duplication.py, TaskExecutor -- is built on. Shadow the platform-bound
+# names with the X11 implementations; see `ok/compat/window_x11.py` for the two documented
+# behaviour deviations.
+#
+# Deliberately NOT shadowed, because upstream is already correct here: `find_display` and
+# `ratio_text_to_number` (pure logic), `WGC_NO_BORDER_MIN_BUILD` (a constant), and
+# `WINDOWS_BUILD_NUMBER` / `windows_graphics_available` (`-1` on non-win32, so the WGC probe
+# short-circuits and never touches `ok.rotypes`, which cannot be imported on Linux).
+#
+# The import sits at the bottom, after every name above is bound, because
+# `ok.compat.window_x11` reaches back into this module for `compare_path_safe` and
+# `get_player_id_from_cmdline`. It does so from inside function bodies, so the cycle cannot
+# bite whichever module is imported first.
+if sys.platform != 'win32':
+    from ok.compat.window_x11 import (  # noqa: E402,F401
+        find_all_visible_windows,
+        find_hwnd,
+        get_exe_by_hwnd,
+        get_window_bounds,
+        is_foreground_window,
+        is_window_minimized,
+        resize_window,
+        show_title_bar,
+    )

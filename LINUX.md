@@ -15,26 +15,27 @@ BitBlt, WGC, DXGI, ADB, browser and NemuIPC backends), so Linux is one more back
 |---|---|---|
 | 0 | Fork, upstream remote, rebase-friendly layout | done |
 | 1 | `import ok` and every lazily-mapped symbol work on Linux | done |
-| 2 | `X11Window` — window discovery/geometry via python-xlib | not started |
+| 2 | `X11Window` — window discovery/geometry via python-xlib | done |
 | 3 | `X11CaptureMethod` — `XGetImage` + MIT-SHM | not started |
 | 4 | `WinePostMessageInteraction` + the in-prefix `PostMessage` shim | not started |
 
-Phase 1 makes the tree *importable, startable and testable* on Linux. It does not yet
-make the app *useful*: `ok/util/window.py` still holds the Windows implementations of
-`find_hwnd` / `get_window_bounds`, which import cleanly here but raise
-`NotImplementedError` naming the symbol if called. Phase 2 replaces those bodies.
+Phase 1 made the tree *importable, startable and testable* on Linux. Phase 2 makes the
+window layer *real*: the app finds the game's X11 window, tracks its geometry, focus and
+minimized state, mutes it in the background, and hands `DeviceManager` a PC device — so
+startup now runs all the way to capture-method selection.
 
 Where startup stops today, with ok-ww's config on Linux:
 
 ```
-OK(config) -> DeviceManager.__init__ -> HwndWindow.__init__
-           -> hwnd_window.py:392 get_monitors_bounds()
-           -> NotImplementedError: win32api.EnumDisplayMonitors
+OK(config) -> DeviceManager -> X11Window -> find_hwnd -> do_start
+           -> update_capture_method(['WGC', 'BitBlt_RenderFull'])
+           -> BitBlt, which imports here but can never produce a frame
 ```
 
-That is Phase 2's first line of work (XRandR via python-xlib), and everything before it —
-config load, game-install detection, the single-instance lock, the whole lazy-import
-graph, `DeviceManager` construction — now runs.
+Everything up to and including capture *selection* runs. What is missing is a capture
+*backend* that works — Phase 3 — and the input backend, Phase 4. Reproduce with ok-ww's
+`tools/check_linux_startup.py`, the Phase 2 exit gate (it lives in ok-ww because it needs
+ok-ww's config).
 
 ## Rebasing onto a new upstream tag
 
@@ -113,6 +114,46 @@ to be — `ok/rotypes/inspectable.py:12` uses the COM vtable prototype form
 ever imported from inside function bodies that do not run here. Keep them out of any
 import sweep.
 
+## What Phase 2 added
+
+| File | Change |
+|---|---|
+| `ok/compat/x11.py` | **new** — the python-xlib window layer: enumeration, `_NET_WM_PID`, geometry, focus, minimized state, RandR monitors, activate, resize. Nothing in it raises; every entry point has a documented empty return |
+| `ok/compat/window_x11.py` | **new** — the Linux bodies of the `ok.util.window` contracts (`find_hwnd`, `get_window_bounds`, `is_foreground_window`, `resize_window`, `find_all_visible_windows`, `show_title_bar`, `get_exe_by_hwnd`, `is_window_minimized`) |
+| `ok/device/capture_methods/x11_window.py` | **new** — `X11Window`, plus `get_monitors_bounds` and the pactl-backed `get_mute_state` / `set_mute_state` |
+| `tests/test_x11_window.py` | **new** — 42 tests: tuple-shape contracts, the two semantics the plan got wrong first time, a drift gate over the copied constructor, and live tests against a real X server |
+| `ok/device/capture_methods/__init__.py` | rebinds `HwndWindow` to `X11Window` on Linux, and shadows the five helpers line 21 imports from `hwnd_window` |
+| `ok/util/window.py` | imports the X11 bodies over the Win32 ones on non-Windows, at the bottom of the file |
+| `ok/core/screenshot.py` | the annotation font is looked up per platform; `os.environ['WINDIR']` is a `KeyError` here |
+
+`X11Window` subclasses `HwndWindow` and overrides only the Win32-bound methods — the
+eleven pure ones (`get_abs_cords`, `get_capture_origin`, `get_top_window_cords`,
+`capture_target_signature`, `update_window`, `update_frame_size`, `frame_ratio`, `stop`,
+`_front_hwnd_candidates`, `_top_hwnd_info`, `__str__`) stay upstream's across rebases.
+`__init__` is a copy, because upstream's calls `get_monitors_bounds()` out of its own
+module globals; `TestUpstreamDrift` walks both ASTs and fails if upstream's constructor
+grows an attribute the copy does not set, or a method the subclass does not have.
+
+Three semantics are load-bearing and easy to get backwards:
+
+* **`visible` means foreground, not mapped.** Upstream sets `visible = self.is_foreground()`,
+  and `MouseResetTask` pins the physical cursor only while `not hwnd.visible` — i.e.
+  exactly during background play. A mapped-based `visible` is True all session and silently
+  disables it.
+* **Iconic is a separate signal.** An iconified X11 window keeps its geometry, so
+  `check_pos` alone never notices; `pos_valid` gets an explicit minimized test, which is
+  what pauses the executor and shows the "game window is minimized" notification.
+* **Identity is `_NET_WM_PID` plus the process command line.** Every Proton window's
+  `WM_CLASS` is `steam_proton`, and the Win32 class (`UnrealWindow`) is invisible from
+  X11, so `class_name` / `top_hwnd_class` are accepted and ignored. The game's name lives
+  only in the Wine command line, which is why `find_hwnd` matches against every `.exe` on
+  it rather than against `/proc/<pid>/exe`.
+
+`find_hwnd` returns `[]` for its `hwnds` element where Windows returns `[biggest]`: Wine
+gives one X toplevel per game, so there is no child/top window to report. All four
+consumers handle the empty list. `real_width` / `real_height` are the window's size, never
+0 — zeros give `DeviceManager` a `0x0` device and freeze change detection.
+
 ## Test baseline on Linux
 
 `opencv-python` must be installed alongside the extras. ~14 modules (`ok/util/color.py`,
@@ -133,8 +174,9 @@ quiet to level 2, which suppresses the final `N failed, M passed` line entirely.
 still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
 crashed run and is not.
 
-Baseline: **376 passed, 6 failed, 1 skipped, 10 subtests passed** (392 collected, Python
-3.12). Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
+Baseline: **418 passed, 6 failed, 1 skipped, 10 subtests passed** (434 collected, Python
+3.12) — 376 of those passes predate Phase 2, which added `tests/test_x11_window.py`.
+Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
 failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
 unparented and outlived its widget, firing `og.executor.current_task` into whatever test
 was running next. It is now parented to the tab and guards on `og.executor is None`.
@@ -150,3 +192,8 @@ The six failures are Windows-only by construction, not port regressions:
 
 None sit on the game path. Re-check this list after a rebase; a *new* failure outside it is
 a regression. CI deselects exactly these six by node id — keep the two lists in step.
+
+Seven of the 418 are live X11 tests: they create a real window and drive it through a real
+server. With no `DISPLAY` they skip (`35 passed, 7 skipped` for that file alone), so CI runs
+the suite under `xvfb-run`. Xvfb has no window manager, and the three tests that need one —
+iconify, activation, resize — skip themselves there; they run in full on a desktop session.

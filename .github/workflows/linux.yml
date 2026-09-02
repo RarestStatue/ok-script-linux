@@ -37,7 +37,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 \
-            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 \
+            xvfb
 
       # Order matters: the scanner says whether the *shape* of the Win32 import surface
       # moved, before the others report that something broke.
@@ -52,11 +53,14 @@ jobs:
       # POSIX), one exact Qt pixel height (font metrics differ per platform), and two
       # pywebview WinForms window-shaping tests. They are enumerated in LINUX.md; keep the
       # two lists in step. Anything failing outside this list is a regression.
+      # Under `xvfb-run` so Phase 2's live X11 tests actually execute here instead of
+      # skipping. Xvfb is a bare X server with no window manager, which those tests expect:
+      # the ones that need a WM (iconify, activation, resize) skip themselves.
       - name: Test suite
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          python -m pytest tests \
+          xvfb-run -a python -m pytest tests \
             --deselect 'tests/test_device_manager.py::TestEmulatorWindowExe::test_resolves_mumu_12_instance_window' \
             --deselect 'tests/test_device_manager.py::TestEmulatorWindowExe::test_resolves_mumu_15_instance_window' \
             --deselect 'tests/test_process.py::TestProcessExecute::test_execute_can_use_os_startfile_when_configured' \

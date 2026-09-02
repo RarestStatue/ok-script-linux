@@ -1,5 +1,6 @@
 import os
 import queue
+import sys
 import threading
 import time
 from datetime import datetime
@@ -15,6 +16,41 @@ from ok.util.file import find_first_existing_file, clear_folder, sanitize_filena
 
 logger = Logger.get_logger(__name__)
 _CLEANUP_FOLDERS = object()
+
+# Screenshot annotations carry task names, which are Chinese in the default locale, so a
+# CJK-capable face comes first on both platforms and a Latin-only one is the last resort.
+_WINDOWS_FONTS = ['msyh.ttc', 'msyh.ttf', 'simsun.ttf', 'simsun.ttc', 'arial.ttf', 'arial.ttc']
+_LINUX_FONTS = ['NotoSansCJK-Regular.ttc', 'NotoSansCJKsc-Regular.otf', 'NotoSansCJK-VF.ttc',
+                'wqy-microhei.ttc', 'wqy-zenhei.ttc', 'DroidSansFallbackFull.ttf',
+                'SourceHanSansSC-Regular.otf', 'DejaVuSans.ttf', 'LiberationSans-Regular.ttf']
+_LINUX_FONT_DIRS = ['/usr/share/fonts', '/usr/local/share/fonts', '/run/host/fonts',
+                    os.path.expanduser('~/.local/share/fonts'), os.path.expanduser('~/.fonts')]
+
+
+def find_annotation_font():
+    r"""A font file for screenshot annotations, or None to fall back to PIL's built-in.
+
+    Windows keeps its fonts in one flat directory, so a direct lookup is enough. Linux
+    nests them by family under several roots and the set varies by distro, so this walks
+    them and takes the first known name -- there is no equivalent of %WINDIR%\Fonts to
+    point at. Returning None is a supported answer on both.
+    """
+    if sys.platform == 'win32':
+        windir = os.environ.get('WINDIR')
+        return find_first_existing_file(_WINDOWS_FONTS, os.path.join(windir, 'Fonts')) if windir else None
+    wanted = {name.lower(): index for index, name in enumerate(_LINUX_FONTS)}
+    best = None
+    for root in _LINUX_FONT_DIRS:
+        if not os.path.isdir(root):
+            continue
+        for directory, _, filenames in os.walk(root):
+            for filename in filenames:
+                index = wanted.get(filename.lower())
+                if index is not None and (best is None or index < best[0]):
+                    best = (index, os.path.join(directory, filename))
+                    if index == 0:
+                        return best[1]
+    return best[1] if best else None
 
 
 class Screenshot:
@@ -45,10 +81,8 @@ class Screenshot:
             self.exit_event.bind_queue(self.task_queue)
             self.thread = threading.Thread(target=self._worker, name="screenshot")
             self.thread.start()
-            fonts_dir = os.path.join(os.environ['WINDIR'], 'Fonts')
-            font = find_first_existing_file(
-                ['msyh.ttc', 'msyh.ttf', 'simsun.ttf', 'simsun.ttc', 'arial.ttf', 'arial.ttc'], fonts_dir)
-            if os.path.exists(font):
+            font = find_annotation_font()
+            if font:
                 logger.debug(f"load font {font}")
                 self.pil_font = ImageFont.truetype(font, 30)
             else:
