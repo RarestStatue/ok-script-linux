@@ -173,6 +173,44 @@ def _walk_for_clients(d, wid, depth, out):
             continue
 
 
+def _frames_a_known_client(child, seen):
+    """True when ``child`` is a reparenting WM's frame around a client we already have.
+
+    Under a *reparenting* WM (kwin_x11, Mutter on X11, Xfwm, Openbox -- all plausible for
+    a Proton session) the root's children are the WM's frames and the clients live one
+    level down, so source 3 would add one frame per managed window on top of the clients
+    source 1 already returned [P2-11]. Not a correctness bug -- a frame carries no
+    ``_NET_WM_PID`` and no name, so it falls out at ``find_hwnd``'s first filter -- but it
+    is measurable. Measured on a nested Xwayland driven by a minimal reparenting WM,
+    10 clients, against the same server and clients under a non-reparenting one:
+
+    ==================  ==========  ==============  ==============
+    ``find_hwnd``       flat        reparent, kept  reparent, this
+    ==================  ==========  ==============  ==============
+    per call            3.17 ms     5.28 ms         3.93 ms
+    ``list_clients``    0.11 ms     0.53 ms         1.00 ms
+    ``no _NET_WM_PID``  0 lines     10 lines        0 lines
+    ==================  ==========  ==============  ==============
+
+    ``list_clients`` alone gets *slower* -- one ``QueryTree`` per frame is a round trip
+    the old loop did not make -- but it buys back three per managed window in
+    ``find_hwnd``, which is the call that runs on the 0.2s poll thread and the only one
+    that matters; both of its callers filter by name or by pid and were paying for the
+    frames either way. On a non-reparenting WM nothing changes (3.17 -> 3.17 ms): the
+    clients are the root's own children and are skipped by ``child.id in seen`` above.
+    The rejection-line column is P2-6's message, whose whole purpose is signal.
+
+    The test is "does it contain something we already have", not "is it override-redirect"
+    or "is it unnamed": an override-redirect toplevel has no child in ``seen`` -- nothing
+    else in the tree holds it, which is precisely why source 3 exists -- so P2-7's window
+    is kept. A frame the WM built around a client that reached us any other way is not.
+    """
+    try:
+        return any(c.id in seen for c in child.query_tree().children)
+    except Exception:
+        return False
+
+
 def list_clients():
     """Toplevel client windows, in the WM's own order. ``[]`` when X11 is unavailable.
 
@@ -190,9 +228,9 @@ def list_clients():
     *WM* sets, so an override-redirect toplevel -- how a client takes the screen without
     asking, a shape fullscreen-exclusive Wine can produce -- is invisible to both.
     Returning on the first non-empty source made 3 dead code under any EWMH WM, i.e.
-    always. The callers filter by process, by size and by name, so the extra ids are
-    harmless: a WM's own frames are override-redirect but carry no ``_NET_WM_PID`` and no
-    title, and fall out at the first filter.
+    always. What source 3 must not do is hand back a *reparenting* WM's frames on top of
+    the clients source 1 already gave us, one per managed window; ``_frames_a_known_client``
+    drops those, and only those -- see its docstring for the measurement [P2-11].
 
     Source 2 stays a fallback, because it is the expensive one: recursing the tree costs
     ~6 ms against ~1.7 ms for sources 1 and 3 together on a 41-child root, and it can only
@@ -227,6 +265,8 @@ def list_clients():
                 attributes = child.get_attributes()
                 if (attributes.map_state == Xlib.X.IsViewable
                         and attributes.win_class == Xlib.X.InputOutput):
+                    if _frames_a_known_client(child, seen):
+                        continue
                     add(child.id)
             except Exception:
                 continue

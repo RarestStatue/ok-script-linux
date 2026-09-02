@@ -323,6 +323,61 @@ class TestFindHwnd(unittest.TestCase):
 
 
 @skip_on_windows
+class TestFrameSkip(unittest.TestCase):
+    """[P2-11] `list_clients`' source 3 must not re-add a reparenting WM's frames.
+
+    Measured on a nested Xwayland with a minimal reparenting WM: keeping them cost
+    `find_hwnd` 5.28 ms/call against 3.17 ms under a non-reparenting WM, and added one
+    `no _NET_WM_PID` line per managed window to P2-6's rejection message. The predicate
+    is unit-tested rather than driven live because reproducing the shape needs a
+    reparenting WM, and neither this machine's session (kwin_wayland, which does not
+    reparent) nor CI (Xvfb, no WM at all) is one.
+    """
+
+    class _Child:
+        def __init__(self, wid, children=(), raises=False):
+            self.id = wid
+            self._children = list(children)
+            self._raises = raises
+
+        def query_tree(self):
+            if self._raises:
+                raise RuntimeError('BadWindow: it went away between the two calls')
+            return unittest.mock.Mock(children=self._children)
+
+    def test_a_frame_around_a_client_we_already_have_is_a_frame(self):
+        from ok.compat import x11
+        client = self._Child(0x1400001)
+        frame = self._Child(0x2000001, children=[client])
+
+        self.assertTrue(x11._frames_a_known_client(frame, {0x1400001}))
+
+    def test_an_override_redirect_toplevel_is_not_a_frame(self):
+        """P2-7's window: nothing else in the tree holds it, which is why source 3 exists.
+        A predicate that dropped unnamed or pid-less windows instead would delete it."""
+        from ok.compat import x11
+        unmanaged = self._Child(0x1400009, children=[])
+
+        self.assertFalse(x11._frames_a_known_client(unmanaged, {0x1400001, 0x1400002}))
+
+    def test_a_toplevel_whose_children_are_all_unknown_is_not_a_frame(self):
+        """A client's own sub-windows are not toplevels and are never in `seen`; a bare
+        X server with no WM at all must keep every one of the root's children."""
+        from ok.compat import x11
+        toplevel = self._Child(0x1400003, children=[self._Child(0x1400004),
+                                                    self._Child(0x1400005)])
+
+        self.assertFalse(x11._frames_a_known_client(toplevel, {0x1400001}))
+
+    def test_a_window_that_dies_mid_walk_is_not_a_frame(self):
+        """Enumeration races window destruction; nothing in `ok.compat.x11` may raise."""
+        from ok.compat import x11
+        gone = self._Child(0x1400006, raises=True)
+
+        self.assertFalse(x11._frames_a_known_client(gone, {0x1400001}))
+
+
+@skip_on_windows
 class TestGetWindowBounds(unittest.TestCase):
 
     def test_folds_the_frame_back_into_the_window_rect(self):
