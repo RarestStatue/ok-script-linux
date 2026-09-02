@@ -321,9 +321,11 @@ def find_hwnd(title, exe_names, frame_width, frame_height, player_id=-1, class_n
         text = x11.get_name(hwnd)
         if title:
             if isinstance(title, str):
-                if title != text:
-                    continue
-            elif not re.search(title, text):
+                title_matched = title == text
+            else:
+                title_matched = bool(re.search(title, text))
+            if not title_matched:
+                rejects.append(f'{hwnd} ({text!r}): title does not match {title!r}')
                 continue
 
         pid = x11.get_pid(hwnd)
@@ -333,6 +335,13 @@ def find_hwnd(title, exe_names, frame_width, frame_height, player_id=-1, class_n
         candidates, cmdline = _exe_candidates(pid)
         if not candidates and not cmdline:
             rejects.append(f'{hwnd} ({text!r}): pid {pid} is not resolvable in /proc')
+            if exe_names:
+                # An unresolvable pid can never match `exe_names`, and the generic
+                # "does not match []" line below would then report the same window twice
+                # with the weaker of the two reasons. Skipping here is a no-op for the
+                # match itself. With `exe_names` unset the window is still a candidate
+                # (`name`/`full_path` fall back to ''), so do not skip it there.
+                continue
 
         if exe_names:
             matched = _match_exe_names(candidates, exe_names)
@@ -369,7 +378,7 @@ def find_hwnd(title, exe_names, frame_width, frame_height, player_id=-1, class_n
             _last_no_match_log = now
             logger.info(f'find_hwnd matched none of {toplevels} toplevel windows '
                         f'(title={title!r} exe_names={exe_names} player_id={player_id}): '
-                        + '; '.join(rejects))
+                        + ('; '.join(rejects) or 'no window passed the filters'))
         return None, 0, None, 0, 0, 0, 0, []
     _last_no_match_log = 0
 

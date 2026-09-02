@@ -264,6 +264,56 @@ class TestFindHwnd(unittest.TestCase):
         self.assertIn('no _NET_WM_PID', message)
         self.assertIn('does not match', message)
 
+    def test_an_unresolvable_pid_is_reported_once_not_twice(self):
+        """[P2-12a] The pressure-vessel shape [GATE-1b] is the diagnosis; the generic
+        `does not match` line for the same window is noise that reads like another one."""
+        from ok.compat import window_x11
+        fake = FakeX11([FakeWindow(0x1400001, pid=4242, name='Ghost')])
+
+        with unittest.mock.patch.object(window_x11, 'x11', fake), \
+                unittest.mock.patch.object(window_x11, '_exe_candidates', return_value=([], [])), \
+                unittest.mock.patch.object(window_x11, '_last_no_match_log', 0), \
+                unittest.mock.patch.object(window_x11.logger, 'info') as info:
+            self.assertEqual(0, window_x11.find_hwnd(None, ['game.exe'], 0, 0)[1])
+
+        message = info.call_args[0][0]
+        self.assertIn('pid 4242 is not resolvable in /proc', message)
+        self.assertNotIn('does not match', message)
+        self.assertEqual(1, message.count('20971521'), 'one window, one reject line')
+
+    def test_an_unresolvable_pid_still_matches_when_no_exe_names_are_given(self):
+        """[P2-12a] The skip must not change matching: with `exe_names` unset a window
+        whose pid is invisible in /proc is still a candidate, with an empty path. A title
+        is required because `find_hwnd` returns a miss outright when both filters are
+        None (`window_x11.py:296`)."""
+        from ok.compat import window_x11
+        fake = FakeX11([FakeWindow(0x1400001, pid=4242, name='Ghost', geometry=(0, 0, 800, 600))])
+
+        with unittest.mock.patch.object(window_x11, 'x11', fake), \
+                unittest.mock.patch.object(window_x11, '_exe_candidates', return_value=([], [])):
+            name, hwnd, full_path = window_x11.find_hwnd('Ghost', None, 0, 0)[:3]
+
+        self.assertEqual(0x1400001, hwnd)
+        self.assertEqual('Ghost', name)
+        self.assertEqual('', full_path)
+
+    def test_a_title_only_miss_says_which_title_did_not_match(self):
+        """[P2-12b] Every window filtered by title left `rejects` empty, so the message
+        ended in a dangling `: `."""
+        from ok.compat import window_x11
+        fake = FakeX11([FakeWindow(0x1400001, pid=4242, name='Other')])
+
+        with unittest.mock.patch.object(window_x11, 'x11', fake), \
+                unittest.mock.patch.object(window_x11, '_exe_candidates',
+                                           return_value=([('game.exe', '/g/game.exe')], [])), \
+                unittest.mock.patch.object(window_x11, '_last_no_match_log', 0), \
+                unittest.mock.patch.object(window_x11.logger, 'info') as info:
+            self.assertEqual(0, window_x11.find_hwnd('Wuthering Waves', None, 0, 0)[1])
+
+        message = info.call_args[0][0]
+        self.assertFalse(message.endswith(': '), 'the reason list must never be empty')
+        self.assertIn("title does not match 'Wuthering Waves'", message)
+
     def test_player_id_filters_on_the_command_line(self):
         fake = FakeX11([FakeWindow(0x1400001, pid=4242, name='emulator')])
         candidates = {4242: ([('dnplayer.exe', '/games/dnplayer.exe')], ['/games/dnplayer.exe', '3'])}
