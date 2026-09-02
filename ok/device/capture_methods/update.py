@@ -48,6 +48,10 @@ def update_capture_method(config, capture_method, hwnd, exit_event=None, selecte
                 # argument.
                 x11_capture.use_composite = (method_name == 'X11_Composite')
                 if x11 := get_capture(capture_method, X11CaptureMethod, hwnd, exit_event):
+                    # Switch the path *now*, not on the next `do_get_frame`: until a frame
+                    # is asked for, `get_name()` would still report the old one, and this
+                    # object is what `DeviceManager` and the GUI log.
+                    x11.use_composite_path(x11_capture.use_composite)
                     logger.info(f'use {method_name} capture')
                     return x11
             elif method_name == 'DXGI':

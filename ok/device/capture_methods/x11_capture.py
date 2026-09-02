@@ -23,9 +23,11 @@ Three decisions are worth knowing before changing anything here:
   ``HwndWindow.get_capture_origin`` does. Using ``real_width``/``real_height`` the way
   ``BitBltCaptureMethod`` does would be wrong here: on Linux those are the *window's* size
   [V18], not a letterboxed child's, so they would undo the aspect-ratio crop.
-* **A minimized window raises rather than returning None**, with a message the UI can show,
-  because "un-minimize the game" is something the user can act on and a generic capture
-  failure is not. Occlusion needs no such treatment on Xwayland [V7].
+* **A minimized window returns None, it does not raise.** A ``CaptureException`` out of a
+  task reaches ``TaskExecutor.py:639`` and is answered with ``task.disable()`` -- a minimize
+  would switch the task off instead of pausing it. The window layer already pauses the
+  executor and tells the user, reversibly, when ``pos_valid`` goes False. Occlusion needs no
+  treatment at all on Xwayland [V7].
 
 ``X11_Composite`` is the same class with ``use_composite`` set, mirroring how
 ``BitBlt_RenderFull`` is ``BitBltCaptureMethod`` with ``bitblt.render_full`` set. It exists
@@ -37,7 +39,6 @@ captures an occluded window.
 import threading
 
 from ok.compat import x11, xshm
-from ok.task.exceptions import CaptureException
 from ok.util.logger import Logger
 
 from ok.device.capture_methods.base import BaseWindowsCaptureMethod
@@ -52,13 +53,18 @@ use_composite = False
 
 
 def x11_capture_available():
-    """True when the pixel path can run at all: libX11/libXext load and DISPLAY is set.
+    """True when the pixel path can run at all: the libraries load, and a display answers.
 
     The sibling of ``windows_graphics_available()``, and used the same way -- to keep
     ``update_capture_method`` from selecting a backend that can never produce a frame,
     so the next entry in the user's ``capture_method`` list gets its turn.
+
+    ``xshm.available()`` alone is not enough: it proves libX11/libXext loaded and
+    ``DISPLAY`` is set, and a stale ``DISPLAY`` passes both while every grab fails.
+    ``x11.available()`` is the window layer's own guard and actually opens a connection,
+    on a connection it then keeps.
     """
-    return xshm.available()
+    return xshm.available() and x11.available()
 
 
 def capture_rect(hwnd_window, window_width=0, window_height=0):
@@ -98,6 +104,7 @@ class X11CaptureMethod(BaseWindowsCaptureMethod):
         super().__init__(hwnd_window)
         self.lock = threading.Lock()
         self.grabber = xshm.X11Grabber(use_composite=use_composite)
+        self._minimized_reported = False
 
     def do_get_frame(self):
         with self.lock:
@@ -122,21 +129,45 @@ class X11CaptureMethod(BaseWindowsCaptureMethod):
                 x, y, width, height = 0, 0, geometry[0], geometry[1]
             frame = self.grabber.grab(hwnd, x, y, width, height)
             if frame is None and x11.exists(hwnd) and x11.is_minimized(hwnd):
-                # Distinguishable on purpose: this is the one capture failure the user can
-                # fix, and `check_pos` cannot see it -- an iconified X11 window keeps its
-                # last geometry [V7].
+                # Deliberately NOT a CaptureException. A CaptureException out of a task
+                # reaches `TaskExecutor`'s `except Exception` (TaskExecutor.py:639), which
+                # calls `task.disable()` (:644) -- so raising here turns a minimize into a
+                # switched-off task the user has to turn back on. The window layer already
+                # handles this correctly and reversibly: `pos_valid` goes False
+                # (x11_window.py:410), the executor is paused and the user is told
+                # "Paused because game window is minimized or out of screen!" (:411-417),
+                # and play resumes when the window comes back.
                 #
                 # `exists` first, and it is not belt and braces: `is_minimized`'s last resort
                 # is "not viewable", which a window id that no longer names anything answers
-                # True. Without the guard, a game that exited would report "the window is
-                # minimized" on every poll until the window layer noticed, which is the one
-                # message a user cannot act on.
-                raise CaptureException('The game window is minimized, X11 cannot capture it. '
-                                       'Restore the window.')
+                # True [V7].
+                if not self._minimized_reported:
+                    self._minimized_reported = True
+                    logger.info(f'{hwnd:#x} is minimized; X11 cannot capture it. '
+                                f'The window layer pauses the executor and notifies.')
+                return None
+            if frame is not None:
+                self._minimized_reported = False
             return frame
 
     def get_name(self):
-        return 'X11_Composite' if self.grabber.use_composite else 'X11'
+        # `composite_active`, not `use_composite`: the composite path degrades to the
+        # direct grab silently, and a name that keeps claiming otherwise is the reason a
+        # composite problem is hard to see in a log.
+        return 'X11_Composite' if self.grabber.composite_active else 'X11'
+
+    def use_composite_path(self, composite):
+        """Switch the grabber between the direct and the XComposite path, now.
+
+        Called by ``update_capture_method``: ``get_capture`` hands back this same object
+        across a reconfiguration, so the path cannot be a constructor argument -- and
+        leaving the rebuild to the next ``do_get_frame`` means ``get_name()`` reports the
+        old path until a frame happens to be asked for.
+        """
+        with self.lock:
+            if self.grabber.use_composite != composite:
+                self.grabber.close()
+                self.grabber = xshm.X11Grabber(use_composite=composite)
 
     def clickable(self):
         # NOT `hwnd_window.visible`: that is a foreground test [V15] and is False for the

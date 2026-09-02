@@ -220,10 +220,30 @@ Five things are load-bearing:
   game) gets a new one per frame. Cached, six grabs 0.25 s apart differed by exactly 0.0 —
   a frozen picture that looks like a working capture. Re-named, 28-57. It costs 3.6 → 5.4
   ms/frame, which is what the direct path costs anyway.
-* **`is_minimized()` answers True for a window id that no longer exists** (its last resort
-  is "not viewable"), so the "the game window is minimized" exception is gated on
-  `x11.exists()` first. Otherwise a game that exited raised the one message a user cannot
-  act on, on every poll.
+* **A minimized window returns None, it does not raise.** A `CaptureException` out of a
+  task reaches `TaskExecutor.py:639` and is answered with `task.disable()`, so raising here
+  would turn a minimize into a task the user has to switch back on by hand. The window
+  layer already pauses the executor and notifies, reversibly, when `pos_valid` goes False
+  (`x11_window.py:410-417`). The report is still gated on `x11.exists()` first, because
+  `is_minimized()`'s last resort is "not viewable", which a window id that no longer exists
+  answers True — and it is logged once per episode, not once per poll.
+
+### System libraries
+
+The pixel path is `ctypes` over the system X libraries, so they are a **runtime
+requirement** that no Python lock can express:
+
+| | Fedora | Debian / Ubuntu |
+|---|---|---|
+| required | `libX11`, `libXext` | `libx11-6`, `libxext6` |
+| optional (`X11_Composite` only) | `libXcomposite` | `libxcomposite1` |
+
+Without `libX11`/`libXext`, `x11_capture_available()` is False, both `X11` and
+`X11_Composite` are skipped, `update_capture_method` returns None and the app starts with
+no capture method — with one log line as the only trace
+(`libX11/libXext are not loadable, X11 capture is unavailable`). Without `libXcomposite`,
+`X11` works and `X11_Composite` degrades to it. CI gets all three transitively through
+`xvfb`, which is why nothing noticed until it was looked for.
 
 `X11` grabs the window directly and `X11_Composite` grabs an XComposite offscreen pixmap.
 The second is for a plain non-compositing X server, where an occluded window's pixels are
@@ -250,9 +270,9 @@ quiet to level 2, which suppresses the final `N failed, M passed` line entirely.
 still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
 crashed run and is not.
 
-Baseline: **484 passed, 6 failed, 1 skipped, 10 subtests passed** (491 collected, Python
+Baseline: **491 passed, 6 failed, 1 skipped, 16 subtests passed** (498 collected, Python
 3.12) — 376 of those passes predate Phase 2 (`tests/test_x11_window.py`, 74) and Phase 3
-(`tests/test_x11_capture.py`, 34).
+(`tests/test_x11_capture.py`, 41).
 Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
 failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
 unparented and outlived its widget, firing `og.executor.current_task` into whatever test
@@ -270,9 +290,9 @@ The six failures are Windows-only by construction, not port regressions:
 None sit on the game path. Re-check this list after a rebase; a *new* failure outside it is
 a regression. CI deselects exactly these six by node id — keep the two lists in step.
 
-Twenty-three of the 484 are live X11 tests: they create a real window and drive it through a
+Twenty-three of the 491 are live X11 tests: they create a real window and drive it through a
 real server — 13 in `test_x11_window.py` (`61 passed, 13 skipped` for that file with no
-`DISPLAY`) and 10 in `test_x11_capture.py` (`24 passed, 10 skipped`). So CI runs the suite
+`DISPLAY`) and 10 in `test_x11_capture.py` (`31 passed, 10 skipped`). So CI runs the suite
 under `xvfb-run`. Xvfb has no window manager, and the five tests that need one — iconify,
 de-iconify-on-activate, the two `resize_window` ones, and the capture layer's iconify test —
 skip themselves there; they run in full on a desktop session.

@@ -152,6 +152,7 @@ _DESTROY_IMAGE_TYPE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(XImage))
 _LOAD_LOCK = threading.Lock()
 _libs = None
 _load_error_logged = False
+_open_error_logged = False
 _error_handler = None       # kept alive for the life of the process; ctypes will not
 # The last protocol error, as (error_code, request_code, minor_code, resourceid). Global
 # because XSetErrorHandler is: a grabber clears it, issues one replyless request, syncs, and
@@ -293,27 +294,65 @@ def visual_masks(visual):
     return int(fields.red_mask), int(fields.green_mask), int(fields.blue_mask)
 
 
+def _channel_fields(image, masks=None):
+    """``((shift, width), ...)`` for B, G, R, or ``None`` for a mask that is absent.
+
+    ``width`` is the part :func:`_channel_indices` used to ignore. A depth-30 TrueColor
+    visual is 10 bits per channel with ``bits_per_pixel`` still 32, and its low set bits
+    land on bytes 0, 1, 2 -- i.e. straight onto the BGRA fast path, where the low byte of
+    each 10-bit field is read as the channel. Mid grey came back as ``[0, 2, 8]``.
+    """
+    red, green, blue = image.red_mask, image.green_mask, image.blue_mask
+    if not (red or green or blue) and masks:
+        red, green, blue = masks
+
+    def field(mask):
+        mask = int(mask)
+        if not mask:
+            return None
+        shift = (mask & -mask).bit_length() - 1
+        return shift, (mask >> shift).bit_length()
+
+    return field(blue), field(green), field(red)
+
+
 def _channel_indices(image, masks=None):
-    """Byte offsets of B, G, R inside each 32-bit pixel, from the image's own masks.
+    """Byte offsets of B, G, R inside each 32-bit pixel, for 8-bit-per-channel visuals.
 
     Verified BGRA on this machine (``byte_order`` LSBFirst, ``R=ff0000 G=ff00 B=ff``,
     ``bits_per_pixel=32``) [V14], which is the ``(0, 1, 2)`` fast path below. The general
     form is here rather than an assertion because a big-endian server or an unusual visual
     is a wrong *picture*, not a crash, and a silently colour-swapped frame is the hardest
     kind of bug to see in a template matcher.
+
+    ``None`` for a channel whose mask is absent *or* is not 8 bits wide; the caller falls
+    back to :func:`_unpack_wide` for the second case.
     """
 
-    def index(mask):
-        if not mask:
+    def index(field):
+        if field is None or field[1] != 8:
             return None
-        shift = (int(mask) & -int(mask)).bit_length() - 1
-        byte = shift // 8
+        byte = field[0] // 8
         return byte if image.byte_order == LSB_FIRST else 3 - byte
 
-    red, green, blue = image.red_mask, image.green_mask, image.blue_mask
-    if not (red or green or blue) and masks:
-        red, green, blue = masks
-    return index(blue), index(green), index(red)
+    return tuple(index(f) for f in _channel_fields(image, masks))
+
+
+def _unpack_wide(array, fields, byte_order):
+    """Channels wider than 8 bits (a depth-30 visual), scaled down to 8. BGR order out."""
+    words = array.astype(np.uint32)
+    if byte_order == LSB_FIRST:
+        words = (words[:, :, 0] | (words[:, :, 1] << 8)
+                 | (words[:, :, 2] << 16) | (words[:, :, 3] << 24))
+    else:
+        words = (words[:, :, 3] | (words[:, :, 2] << 8)
+                 | (words[:, :, 1] << 16) | (words[:, :, 0] << 24))
+    out = np.empty(array.shape[:2] + (3,), dtype=np.uint8)
+    for channel, (shift, width) in enumerate(fields):        # fields is (blue, green, red)
+        value = (words >> shift) & ((1 << width) - 1)
+        value = value >> (width - 8) if width >= 8 else value << (8 - width)
+        out[:, :, channel] = value.astype(np.uint8)
+    return out
 
 
 def image_to_bgr(image, masks=None):
@@ -335,14 +374,19 @@ def image_to_bgr(image, masks=None):
     buffer = (ctypes.c_ubyte * (stride * height)).from_address(frame.data)
     array = np.frombuffer(buffer, dtype=np.uint8).reshape(height, pixels_per_row, 4)
 
+    fields = _channel_fields(frame, masks)
+    if None in fields:
+        raise ValueError(f'X11 image has no RGB masks: {frame.red_mask:#x} '
+                         f'{frame.green_mask:#x} {frame.blue_mask:#x}')
     blue, green, red = _channel_indices(frame, masks)
     if (blue, green, red) == (0, 1, 2):
         # The measured path: one 0.15 ms pass that drops the alpha byte and copies.
         bgr = cv2.cvtColor(array, cv2.COLOR_BGRA2BGR)
+    elif None in (blue, green, red):
+        # A channel that is not 8 bits wide -- a depth-30 (10-bit) visual. Byte indices
+        # cannot express it, and taking the fast path anyway is a silently wrong picture.
+        bgr = _unpack_wide(array, fields, frame.byte_order)
     else:
-        if None in (blue, green, red):
-            raise ValueError(f'X11 image has no RGB masks: {frame.red_mask:#x} '
-                             f'{frame.green_mask:#x} {frame.blue_mask:#x}')
         bgr = np.ascontiguousarray(array[:, :, [blue, green, red]])
     if pixels_per_row != width:
         bgr = np.ascontiguousarray(bgr[:, :width])
@@ -381,14 +425,23 @@ class X11Grabber:
         libs = _load()
         if libs is None:
             return None
+        global _open_error_logged
         name = os.environ.get('DISPLAY')
         if not name:
-            logger.error('DISPLAY is not set; X11 capture needs X11 or Xwayland')
+            # Once, not per grab: `_open` runs on every `grab`, so an unanswerable DISPLAY
+            # made the log the failure rather than a report of it. Same shape as `_load`'s
+            # `_load_error_logged`.
+            if not _open_error_logged:
+                _open_error_logged = True
+                logger.error('DISPLAY is not set; X11 capture needs X11 or Xwayland')
             return None
         display = libs.x11.XOpenDisplay(name.encode())
         if not display:
-            logger.error(f'cannot connect to X display {name!r} for capture')
+            if not _open_error_logged:
+                _open_error_logged = True
+                logger.error(f'cannot connect to X display {name!r} for capture')
             return None
+        _open_error_logged = False
         self._display = display
         return display
 
@@ -673,3 +726,14 @@ class X11Grabber:
         """True once a shared segment is attached -- for diagnostics and the tests."""
         with self._lock:
             return self._image is not None
+
+    @property
+    def composite_active(self):
+        """True when grabs really are going through the XComposite pixmap.
+
+        Distinct from ``use_composite``, which is what was asked for: the composite path
+        falls back to the direct grab silently and permanently on a missing libXcomposite,
+        a server without the extension, or a refused redirect.
+        """
+        with self._lock:
+            return bool(self.use_composite and not self._composite_failed)

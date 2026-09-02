@@ -29,7 +29,10 @@ skip_on_windows = unittest.skipIf(sys.platform == 'win32',
 BGRA = (0xff0000, 0xff00, 0xff)   # red, green, blue masks of a depth-24 TrueColor visual
 
 
-def make_image(pixels, byte_order=0, masks=BGRA, stride=None, bits_per_pixel=32):
+DEPTH30 = (0x3FF00000, 0x000FFC00, 0x000003FF)   # red, green, blue of a 10-bit visual
+
+
+def make_image(pixels, byte_order=0, masks=BGRA, stride=None, bits_per_pixel=32, depth=24):
     """A real ``XImage`` over a Python buffer. Returns ``(pointer, buffer)``.
 
     The buffer must outlive the pointer, which is why it comes back too.
@@ -44,10 +47,18 @@ def make_image(pixels, byte_order=0, masks=BGRA, stride=None, bits_per_pixel=32)
         buffer[start:start + width * 4] = bytes(pixels[row].reshape(-1).tolist())
     image = xshm.XImage(width=width, height=height, format=xshm.Z_PIXMAP,
                         data=ctypes.cast(buffer, ctypes.c_void_p).value,
-                        byte_order=byte_order, depth=24, bytes_per_line=stride,
+                        byte_order=byte_order, depth=depth, bytes_per_line=stride,
                         bits_per_pixel=bits_per_pixel,
                         red_mask=masks[0], green_mask=masks[1], blue_mask=masks[2])
     return ctypes.pointer(image), buffer
+
+
+def make_10bit_image(r, g, b, byte_order=0):
+    """One depth-30 pixel. ``bits_per_pixel`` is still 32, which is the whole trap."""
+    word = (r << 20) | (g << 10) | b
+    order = range(0, 32, 8) if byte_order == 0 else range(24, -8, -8)
+    pixels = np.array([[[(word >> s) & 0xff for s in order]]], dtype=np.uint8)
+    return make_image(pixels, byte_order=byte_order, masks=DEPTH30, depth=30)
 
 
 @skip_on_windows
@@ -125,6 +136,39 @@ class TestImageToBgr(unittest.TestCase):
             xshm.image_to_bgr(image)
         self.assertIn('16 bits per pixel', str(caught.exception))
 
+    def test_a_ten_bit_visual_is_not_read_as_eight_bit(self):
+        """A depth-30 visual lands on the BGRA fast path unless the mask *width* is checked.
+
+        Unfixed, mid grey came back as [0, 2, 8] -- not a tint, a picture whose luminance is
+        not even monotonic, with no exception and no log line.
+        """
+        from ok.compat import xshm
+
+        for (r, g, b), expected in (((1023, 0, 0), [0, 0, 255]),
+                                    ((0, 1023, 0), [0, 255, 0]),
+                                    ((0, 0, 1023), [255, 0, 0]),
+                                    ((512, 512, 512), [128, 128, 128]),
+                                    ((1023, 1023, 1023), [255, 255, 255]),
+                                    ((0, 0, 0), [0, 0, 0])):
+            with self.subTest(pixel=(r, g, b)):
+                image, _buffer = make_10bit_image(r, g, b)
+                self.assertEqual(expected, xshm.image_to_bgr(image)[0, 0].tolist())
+
+    def test_a_ten_bit_visual_on_a_big_endian_server(self):
+        from ok.compat import xshm
+
+        image, _buffer = make_10bit_image(1023, 0, 0, byte_order=1)
+        self.assertEqual([0, 0, 255], xshm.image_to_bgr(image)[0, 0].tolist())
+
+    def test_the_eight_bit_path_still_takes_the_cheap_copy(self):
+        """The regression guard for the fix: depth 24 must not fall into `_unpack_wide`."""
+        from ok.compat import xshm
+
+        pixels = np.array([[[1, 2, 3, 255]]], dtype=np.uint8)
+        image, _buffer = make_image(pixels)
+        self.assertEqual((0, 1, 2), xshm._channel_indices(image.contents))
+        self.assertEqual([1, 2, 3], xshm.image_to_bgr(image)[0, 0].tolist())
+
 
 class FakeHwndWindow:
     """Everything `X11CaptureMethod` reads off the window object."""
@@ -155,6 +199,11 @@ class FakeGrabber:
         self.geometry = geometry
         self.calls = []
         self.closed = False
+        self._composite_failed = False
+
+    @property
+    def composite_active(self):
+        return bool(self.use_composite and not self._composite_failed)
 
     def window_geometry(self, wid):
         return self.geometry
@@ -250,17 +299,45 @@ class TestX11CaptureMethod(unittest.TestCase):
         self.assertIsNone(method.get_frame())
         self.assertEqual([], grabber.calls)
 
-    def test_a_minimized_window_raises_something_the_user_can_act_on(self):
-        """[V7]: an iconic window has no pixels, and `check_pos` cannot see it."""
-        from ok.task.exceptions import CaptureException
+    def test_a_minimized_window_is_no_frame_and_does_not_kill_the_task(self):
+        """A CaptureException here reaches TaskExecutor.py:639 -> task.disable().
+
+        Minimizing the game must pause the bot (the window layer does that through
+        `pos_valid`), never switch the task off. Returning None is what keeps that true.
+        """
         from ok.device.capture_methods import x11_capture
 
         method = self.build(FakeGrabber(frame=None))
         with unittest.mock.patch.object(x11_capture.x11, 'exists', return_value=True), \
                 unittest.mock.patch.object(x11_capture.x11, 'is_minimized', return_value=True):
-            with self.assertRaises(CaptureException) as caught:
-                method.get_frame()
-        self.assertIn('minimized', str(caught.exception))
+            self.assertIsNone(method.get_frame())
+            self.assertIsNone(method.get_frame())      # reported once, not per poll
+
+    def test_the_minimized_notice_is_logged_once_per_episode(self):
+        from ok.device.capture_methods import x11_capture
+
+        grabber = FakeGrabber(frame=None)
+        method = self.build(grabber)
+        minimized = lambda: (
+            unittest.mock.patch.object(x11_capture.x11, 'exists', return_value=True),
+            unittest.mock.patch.object(x11_capture.x11, 'is_minimized', return_value=True))
+
+        exists, is_minimized = minimized()
+        with exists, is_minimized, \
+                unittest.mock.patch.object(x11_capture.logger, 'info') as info:
+            method.get_frame()
+            method.get_frame()
+            self.assertEqual(1, info.call_count)
+
+        grabber.frame = np.zeros((900, 1600, 3), dtype=np.uint8)   # window restored
+        method.get_frame()
+
+        exists, is_minimized = minimized()
+        grabber.frame = None
+        with exists, is_minimized, \
+                unittest.mock.patch.object(x11_capture.logger, 'info') as info:
+            method.get_frame()
+            self.assertEqual(1, info.call_count)       # a new episode reports again
 
     def test_a_window_that_no_longer_exists_is_not_reported_as_minimized(self):
         """`is_minimized`'s last resort is "not viewable", which a dead id answers True.
@@ -322,6 +399,15 @@ class TestX11CaptureMethod(unittest.TestCase):
             self.assertTrue(method.grabber.use_composite)
             self.assertEqual('X11_Composite', method.get_name())
 
+    def test_the_name_follows_the_path_actually_taken(self):
+        """`use_composite` is what was asked for; the fallback is silent and permanent."""
+        method = self.build(FakeGrabber(use_composite=True))
+
+        self.assertEqual('X11_Composite', method.get_name())
+
+        method.grabber._composite_failed = True          # silently fell back
+        self.assertEqual('X11', method.get_name())
+
     def test_close_releases_the_display_and_the_segment(self):
         grabber = FakeGrabber()
         method = self.build(grabber)
@@ -358,6 +444,49 @@ class TestUpdateCaptureMethod(unittest.TestCase):
         self.assertEqual('X11_Composite', capture.get_name())
         self.assertTrue(capture.grabber.use_composite)
         capture.close()
+
+    def test_switching_the_path_takes_effect_before_the_next_frame(self):
+        """`get_capture` reuses the object, so `update_capture_method` must not wait.
+
+        Left to `do_get_frame`'s lazy rebuild, `get_name()` reports the old path until a
+        frame happens to be asked for -- and that name is what `DeviceManager`, the GUI and
+        `tools/check_linux_startup.py` log.
+        """
+        import ok.device.capture_methods.update as update
+
+        capture = self.select(['X11'])
+        self.assertEqual('X11', capture.get_name())
+
+        with unittest.mock.patch.object(update, 'x11_capture_available', return_value=True):
+            same = update.update_capture_method({'capture_method': ['X11_Composite']}, capture,
+                                                capture.hwnd_window, exit_event=None)
+
+        self.assertIs(capture, same)
+        self.assertTrue(same.grabber.use_composite)
+        self.assertEqual('X11_Composite', same.get_name())   # without a frame first
+        same.close()
+
+    def test_an_unanswerable_display_is_not_available(self):
+        """A stale DISPLAY passes `xshm.available()` and then fails every grab.
+
+        `xshm.available()` is `the libraries load` and `DISPLAY is set`; neither proves a
+        server answers. Measured before the fix with `DISPLAY=:99`:
+        `x11_capture_available()` True, `x11.available()` False, and one ERROR per grab.
+
+        `x11.available` is patched rather than pointing the real DISPLAY at a dead server:
+        `ok/compat/x11.py` memoises its connection in a module global, so a test that
+        actually connects to `:99` leaves a None behind and every live test later in the
+        same process silently skips or fails.
+        """
+        from ok.compat import x11
+        from ok.device.capture_methods import x11_capture
+
+        with unittest.mock.patch.object(x11, 'available', return_value=False), \
+                unittest.mock.patch('ok.compat.xshm.available', return_value=True):
+            self.assertFalse(x11_capture.x11_capture_available())
+        with unittest.mock.patch.object(x11, 'available', return_value=True), \
+                unittest.mock.patch('ok.compat.xshm.available', return_value=True):
+            self.assertTrue(x11_capture.x11_capture_available())
 
     def test_an_unavailable_pixel_path_falls_through_to_the_next_method(self):
         """No libX11, no DISPLAY: the next entry in the user's list must get its turn.
@@ -545,19 +674,22 @@ class TestLiveCapture(unittest.TestCase):
         self._assert_painted(frame)
         np.testing.assert_array_equal(direct, frame)
 
-    def test_an_iconified_window_is_a_capture_exception_not_a_stale_frame(self):
+    def test_an_iconified_window_is_no_frame_not_a_stale_one(self):
         """Iconic means unmapped, and an unmapped window has no pixels [V7].
 
         The failure this guards is not an exception -- it is the opposite: a compositing WM
         keeps a backing pixmap alive, so a capture that did not check `map_state` could go
         on returning the last frame the game drew, forever, and every task downstream would
         act on a picture of the past.
+
+        It must be None and *not* a `CaptureException`: one out of a task reaches
+        `TaskExecutor.py:639` and is answered with `task.disable()`, which would turn a
+        minimize into a switched-off task. The window layer pauses instead, reversibly.
         """
         from Xlib import X
         from Xlib.protocol import event
         from ok.compat import x11
         from ok.device.capture_methods.x11_capture import X11CaptureMethod
-        from ok.task.exceptions import CaptureException
 
         if not x11.get_property(self.display.screen().root.id, '_NET_SUPPORTING_WM_CHECK'):
             self.skipTest('iconify is a request to a window manager; none is running')
@@ -578,9 +710,7 @@ class TestLiveCapture(unittest.TestCase):
             if not self._wait_for(lambda: x11.is_minimized(self.wid)):
                 self.skipTest('the window manager did not iconify the test window')
 
-            with self.assertRaises(CaptureException) as caught:
-                method.get_frame()
-            self.assertIn('minimized', str(caught.exception))
+            self.assertIsNone(method.get_frame())
 
             self.window.map()
             self.display.sync()
