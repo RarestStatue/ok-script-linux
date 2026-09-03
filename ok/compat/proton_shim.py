@@ -393,7 +393,12 @@ def _digest(path):
 
 
 def install_shim(game, shim_exe):
-    """Copy the shim into the prefix's ``drive_c``, if it is not already the same file."""
+    """Copy the shim into the prefix's ``drive_c``, if it is not already the same file.
+
+    Written to a temporary name and renamed into place: an older shim from a previous
+    session may still be *running* out of that path, and writing over a mapped executable
+    is ``ETXTBSY``. A rename is atomic and leaves the running process on the old inode.
+    """
     target = os.path.join(game.drive_c, SHIM_EXE_NAME)
     if os.path.isfile(target):
         try:
@@ -402,7 +407,9 @@ def install_shim(game, shim_exe):
         except OSError:
             pass
     os.makedirs(game.drive_c, exist_ok=True)
-    shutil.copy2(shim_exe, target)
+    staged = target + '.new'
+    shutil.copy2(shim_exe, staged)
+    os.replace(staged, target)
     logger.info(f'installed the input shim into {target}')
     return target
 

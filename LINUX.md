@@ -264,7 +264,7 @@ already captures an occluded window, verified against the game with a window cov
 |---|---|
 | `ok/compat/proton_shim.py` | **new** — Steam library / `appmanifest` / `config_info` parsing, the shim's launch shapes (`proton run` and the SteamLinuxRuntime entry point), the handshake file, and the authenticated line client |
 | `ok/device/interaction_methods/wine_post_message.py` | **new** — `WinePostMessageInteraction`: `PostMessageInteraction` method for method, over the socket |
-| `tests/test_wine_post_message.py` | **new** — 62 tests: the Steam/Proton parsing against a fabricated tree, the protocol against a real loopback server, and the backend's semantics |
+| `tests/test_wine_post_message.py` | **new** — 63 tests: the Steam/Proton parsing against a fabricated tree, the protocol against a real loopback server, and the backend's semantics |
 | `ok/device/interaction_methods/base.py` | `get_cursor_pos()` / `set_cursor_pos()` on the interface, so task code stops calling `win32api` directly |
 | `ok/device/interaction_methods/__init__.py` | exports `WinePostMessageInteraction` |
 | `ok/device/DeviceManager.py` | the `'WinePostMessage'` branch in **both** selection ladders — the constructor's and `set_interaction`'s, which the GUI picker uses |
@@ -332,9 +332,9 @@ quiet to level 2, which suppresses the final `N failed, M passed` line entirely.
 still exits 1 and its last visible line is a `FAILED` row, which looks like a truncated or
 crashed run and is not.
 
-Baseline: **553 passed, 6 failed, 1 skipped, 16 subtests passed** (560 collected, Python
+Baseline: **554 passed, 6 failed, 1 skipped, 16 subtests passed** (561 collected, Python
 3.12) — 376 of those passes predate Phase 2 (`tests/test_x11_window.py`, 74), Phase 3
-(`tests/test_x11_capture.py`, 41) and Phase 4 (`tests/test_wine_post_message.py`, 62).
+(`tests/test_x11_capture.py`, 41) and Phase 4 (`tests/test_wine_post_message.py`, 63).
 Reproducible run to run — the suite used to be flaky across files, with 2-6 extra
 failures drifting between runs of the same command, because `TaskTab`'s 1s `QTimer` was
 unparented and outlived its widget, firing `og.executor.current_task` into whatever test

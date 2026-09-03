@@ -268,6 +268,15 @@ class TestLaunchFallback(unittest.TestCase):
         installed = os.path.join(self.game.drive_c, 'okww-input-shim.exe')
         self.assertEqual(b'MZ fake', open(installed, 'rb').read())
 
+    def test_the_shim_is_replaced_even_while_an_older_one_is_running(self):
+        """Writing over a mapped executable is ETXTBSY; the copy renames into place."""
+        installed = os.path.join(self.game.drive_c, 'okww-input-shim.exe')
+        with open(installed, 'wb') as handle:
+            handle.write(b'MZ older build')
+        start_shim(self.game, shim_exe=self.shim, runner=self._runner(1), timeout=1)
+        self.assertEqual(b'MZ fake', open(installed, 'rb').read())
+        self.assertFalse(os.path.exists(installed + '.new'))
+
     def test_a_stale_handshake_cannot_be_mistaken_for_this_launch(self):
         with open(self.game.handshake_path, 'w') as handle:
             handle.write('port=1\ntoken=stale\nstatus=ready\n')
