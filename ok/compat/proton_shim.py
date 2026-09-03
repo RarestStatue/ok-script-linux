@@ -407,13 +407,21 @@ def install_shim(game, shim_exe):
     return target
 
 
-def shim_argv(exe_name=WUWA_EXE, hwnd_class='UnrealWindow', idle_exit=600):
-    """The shim's own arguments -- identical in both launch shapes."""
-    return [SHIM_EXE_WINPATH,
+def shim_argv(exe_name=WUWA_EXE, hwnd_class='UnrealWindow', idle_exit=600,
+              child_class=None):
+    """The shim's own arguments -- identical in both launch shapes.
+
+    ``child_class`` exists for the offline notepad harness, which has to reach an ``Edit``
+    child; the game itself takes input on its toplevel, like upstream on Windows.
+    """
+    argv = [SHIM_EXE_WINPATH,
             '--exe', exe_name,
             '--class', hwnd_class or '-',
             '--handshake', HANDSHAKE_WINPATH,
             '--idle-exit', str(idle_exit)]
+    if child_class:
+        argv += ['--child-class', child_class]
+    return argv
 
 
 def proton_command(game, argv):

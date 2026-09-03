@@ -168,6 +168,11 @@ class TestSteamResolution(unittest.TestCase):
         self.assertEqual(['--verb=run', '--'], container[1:3])
         self.assertEqual(direct, container[3:])
 
+    def test_the_child_class_argument_is_only_there_when_asked_for(self):
+        """The game takes input on its toplevel; only the notepad harness needs a child."""
+        self.assertNotIn('--child-class', shim_argv())
+        self.assertEqual(['--child-class', 'Edit'], shim_argv(child_class='Edit')[-2:])
+
     def test_the_environment_points_proton_at_the_games_own_prefix(self):
         game = resolve_steam_game(appid=APPID, environ=self.environ)
         env = launch_env(game, environ={})
