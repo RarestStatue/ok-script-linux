@@ -16,6 +16,7 @@ Three layers are covered here, and each one has failed silently at least once in
 
 import os
 import socket
+import sys
 import threading
 import time
 import unittest
@@ -691,6 +692,20 @@ class TestReconnect(unittest.TestCase):
         interaction.send_key_up('F1')
         self.assertIsNone(interaction._client)
         self.assertTrue(asked)
+
+
+class TestPynputFallback(unittest.TestCase):
+    """§4d's fallback is a config entry, not a build -- but it must not cry wolf."""
+
+    def test_is_admin_answers_the_linux_question_on_linux(self):
+        import os as _os
+
+        from ok.util.process import is_admin
+
+        if sys.platform == 'win32':
+            self.skipTest('this is about the Linux branch')
+        self.assertEqual(_os.geteuid() == 0, is_admin())
+        self.assertIsInstance(is_admin(), bool)
 
 
 class TestTiming(unittest.TestCase):

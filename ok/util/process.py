@@ -31,6 +31,13 @@ _exit_watchdog_started = False
 
 
 def is_admin():
+    if sys.platform != 'win32':
+        # `PynputInteraction.__init__` calls this and logs an error when it is False. On
+        # Linux the Windows question ("can this process read the C drive directly") has no
+        # meaning and the stubbed `windll` made it answer False, so the foreground input
+        # backend announced a privilege problem it does not have, on every start. XTEST
+        # needs no privilege; root would be the wrong answer here.
+        return os.geteuid() == 0
     try:
         # Only Windows users with admin privileges can read the C drive directly
         return ctypes.windll.shell32.IsUserAnAdmin()
